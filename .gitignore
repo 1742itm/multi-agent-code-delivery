@@ -1,0 +1,16 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+
+# 任务产物（沙箱代码与产出文档）
+workspace/
+
+# 手工运行脚本时落在项目根目录的产物
+/output/
+
+# 密钥（含 DeepSeek API Key，绝不入库）
+.env
+
+# IDE 生成的方案/文档目录
+.trae/

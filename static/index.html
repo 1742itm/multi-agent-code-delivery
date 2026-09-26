@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多角色协作任务 Agent</title>
+<style>
+  :root {
+    --blue: #2563eb;
+    --blue-dark: #1d4ed8;
+    --blue-light: #eff6ff;
+    --green: #16a34a;
+    --red: #dc2626;
+    --amber: #d97706;
+    --gray: #6b7280;
+    --border: #e5e7eb;
+    --bg: #f8fafc;
+    --text: #1f2937;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", -apple-system, sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    background: #fff; border-bottom: 1px solid var(--border);
+    padding: 14px 24px; display: flex; align-items: center; gap: 12px;
+  }
+  header .logo {
+    width: 32px; height: 32px; border-radius: 8px; background: var(--blue);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-weight: bold; font-size: 18px;
+  }
+  header h1 { font-size: 17px; font-weight: 600; }
+  header .sub { font-size: 12px; color: var(--gray); margin-top: 2px; }
+
+  .layout { flex: 1; display: flex; overflow: hidden; }
+
+  /* 左侧栏 */
+  aside {
+    width: 320px; min-width: 320px; background: #fff;
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .aside-section { padding: 16px; border-bottom: 1px solid var(--border); }
+  .aside-section h2 { font-size: 13px; color: var(--gray); margin-bottom: 10px; font-weight: 600; }
+  textarea {
+    width: 100%; border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; font-size: 13px; resize: vertical; font-family: inherit;
+    line-height: 1.6; outline: none;
+  }
+  textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-light); }
+  .btn {
+    border: none; border-radius: 8px; cursor: pointer; font-size: 14px;
+    padding: 10px 16px; font-family: inherit; transition: background .15s;
+  }
+  .btn-primary { background: var(--blue); color: #fff; width: 100%; margin-top: 10px; font-weight: 600; }
+  .btn-primary:hover { background: var(--blue-dark); }
+  .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+  .btn-ghost {
+    background: #fff; border: 1px solid var(--border); color: var(--text);
+    padding: 6px 12px; font-size: 13px;
+  }
+  .btn-ghost:hover { border-color: var(--blue); color: var(--blue); }
+  .hint { font-size: 12px; color: var(--gray); margin-top: 8px; line-height: 1.5; }
+
+  .runs { flex: 1; overflow-y: auto; padding: 8px; }
+  .run-item {
+    padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px;
+    border: 1px solid transparent;
+  }
+  .run-item:hover { background: var(--bg); }
+  .run-item.active { background: var(--blue-light); border-color: #bfdbfe; }
+  .run-item .rid { font-size: 12px; font-family: Consolas, monospace; color: var(--blue); }
+  .run-item .req {
+    font-size: 12px; color: var(--text); margin-top: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    margin-left: 6px; vertical-align: middle;
+  }
+  .badge.running { background: #dbeafe; color: var(--blue); }
+  .badge.done, .badge.archived { background: #dcfce7; color: var(--green); }
+  .badge.failed, .badge.rejected { background: #fee2e2; color: var(--red); }
+
+  /* 迭代按钮与血缘 */
+  .iter-btn {
+    float: right; border: 1px solid var(--border); background: #fff;
+    border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer;
+    color: var(--gray); font-family: inherit; line-height: 1.5;
+  }
+  .iter-btn:hover { border-color: var(--amber); color: var(--amber); }
+  .run-item .lineage { font-size: 11px; color: var(--amber); margin-top: 3px; }
+  .lineage-banner {
+    background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 14px;
+  }
+
+  /* 迭代弹窗 */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(15,23,42,.45);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal {
+    background: #fff; border-radius: 12px; width: 540px; max-width: 92vw;
+    padding: 22px; box-shadow: 0 20px 50px rgba(0,0,0,.25);
+  }
+  .modal h3 { font-size: 16px; margin-bottom: 4px; }
+  .modal .base-info {
+    font-size: 12px; color: var(--gray); margin: 10px 0;
+    background: var(--bg); border-radius: 8px; padding: 8px 10px;
+    line-height: 1.6; word-break: break-all;
+  }
+  .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+  .modal .actions .btn { width: auto; margin-top: 0; padding: 8px 18px; }
+  .btn-warn { background: var(--amber); color: #fff; font-weight: 600; }
+  .btn-warn:hover { background: #b45309; }
+  .btn-warn:disabled { background: #fcd34d; cursor: not-allowed; }
+
+  /* 右侧主区 */
+  main { flex: 1; overflow-y: auto; padding: 24px; }
+  .empty {
+    height: 100%; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; color: var(--gray); gap: 12px;
+  }
+  .empty .icon { font-size: 42px; }
+  .card {
+    background: #fff; border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .card h3 { font-size: 15px; margin-bottom: 14px; }
+
+  /* 阶段步骤条 */
+  .steps { display: flex; gap: 0; margin-bottom: 6px; }
+  .step { flex: 1; text-align: center; position: relative; font-size: 13px; }
+  .step .dot {
+    width: 26px; height: 26px; border-radius: 50%; background: #e5e7eb;
+    color: var(--gray); margin: 0 auto 8px; display: flex;
+    align-items: center; justify-content: center; font-weight: 600;
+    position: relative; z-index: 1;
+  }
+  .step::before {
+    content: ""; position: absolute; top: 13px; left: -50%;
+    width: 100%; height: 2px; background: #e5e7eb;
+  }
+  .step:first-child::before { display: none; }
+  .step.running .dot { background: var(--blue); color: #fff; animation: pulse 1.2s infinite; }
+  .step.done .dot { background: var(--green); color: #fff; }
+  .step.done::before { background: var(--green); }
+  .step.running::before { background: var(--green); }
+  .step.failed .dot { background: var(--red); color: #fff; }
+  .step .label { color: var(--gray); font-size: 12px; }
+  .step.running .label, .step.done .label, .step.failed .label { color: var(--text); font-weight: 600; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.4);} 50% { box-shadow: 0 0 0 8px rgba(37,99,235,0);} }
+
+  .stage-output {
+    margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 12px;
+  }
+  .stage-output summary { cursor: pointer; font-size: 13px; color: var(--blue); }
+  pre.output {
+    background: #0f172a; color: #e2e8f0; padding: 14px; border-radius: 8px;
+    font-family: Consolas, "Courier New", monospace; font-size: 12.5px;
+    line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    max-height: 320px; overflow-y: auto; margin-top: 10px;
+  }
+  .error-box {
+    background: #fef2f2; border: 1px solid #fecaca; color: var(--red);
+    padding: 12px; border-radius: 8px; font-size: 13px;
+    white-space: pre-wrap; font-family: Consolas, monospace; margin-top: 10px;
+  }
+
+  /* 文件工作区 */
+  .work-tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+  select {
+    padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px;
+    font-size: 13px; font-family: inherit; background: #fff; max-width: 260px;
+  }
+  .tab-btn {
+    padding: 7px 16px; border: 1px solid var(--border); background: #fff;
+    border-radius: 8px; cursor: pointer; font-size: 13px; font-family: inherit;
+  }
+  .tab-btn.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+
+  .code-view {
+    background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; font-family: Consolas, monospace; font-size: 12.5px;
+    line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    max-height: 340px; overflow-y: auto; margin-bottom: 14px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row label { font-size: 13px; color: var(--gray); }
+  .row input[type=number] {
+    width: 70px; padding: 7px 10px; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 13px;
+  }
+  .exec-result { margin-top: 14px; }
+  .exec-result .rc { font-size: 13px; margin-bottom: 8px; }
+  .exec-result .rc code {
+    padding: 2px 8px; border-radius: 6px; font-family: Consolas, monospace;
+  }
+  .rc-ok code { background: #dcfce7; color: var(--green); }
+  .rc-bad code { background: #fee2e2; color: var(--red); }
+  .pane-label { font-size: 12px; color: var(--gray); margin: 10px 0 4px; }
+  .stderr { color: #fca5a5; }
+  .muted { color: var(--gray); font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Agent</div>
+  <div>
+    <h1>多角色协作任务 Agent</h1>
+    <div class="sub">需求分析师 → 代码开发 → 测试验证 → 文档撰写　|　全部代码在安全沙箱中执行</div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="aside-section">
+      <h2>提交新需求</h2>
+      <textarea id="requirement" rows="5" placeholder="例如：实现一个支持加减乘除与除零保护的命令行计算器"></textarea>
+      <button class="btn btn-primary" id="submitBtn">开始生成</button>
+      <div class="hint">任务运行约需数分钟，期间四个角色会顺序协作；同一时间只运行一个任务。</div>
+    </div>
+    <div class="aside-section" style="border-bottom:none; padding-bottom:6px;">
+      <h2>历史任务</h2>
+    </div>
+    <div class="runs" id="runsList">
+      <div class="muted" style="padding:0 12px;">加载中…</div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <div class="empty">
+      <div class="icon">🤖</div>
+      <div>在左侧输入需求开始一个新任务，或选择历史任务查看与运行脚本</div>
+    </div>
+  </main>
+</div>
+
+<!-- 基于历史任务迭代的弹窗 -->
+<div class="modal-overlay" id="iterModal">
+  <div class="modal">
+    <h3>基于历史任务迭代修改</h3>
+    <div class="base-info" id="iterBaseInfo"></div>
+    <textarea id="iterRequirement" rows="6"
+      placeholder="描述你要在这个版本基础上做的修改，例如：为计算器增加取模（%）和幂运算（^）"></textarea>
+    <div class="hint">系统会把基线任务的代码、原需求分析、测试报告与最终报告复制到新沙箱，
+      开发将在旧代码上增量修改、测试会做回归验证；基线任务保持不变。</div>
+    <div class="actions">
+      <button class="btn btn-ghost" id="iterCancel">取消</button>
+      <button class="btn btn-warn" id="iterConfirm">开始迭代</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentRunId = null;
+let pollTimer = null;
+let currentTab = "script";   // script | docs
+let currentPy = null;
+let currentMd = null;
+
+// ---------------- 历史任务列表 ----------------
+async function loadRuns(selectId) {
+  const resp = await fetch("/api/runs");
+  const data = await resp.json();
+  const box = $("runsList");
+  if (!data.runs.length) {
+    box.innerHTML = '<div class="muted" style="padding:0 12px;">暂无历史任务</div>';
+    return;
+  }
+  const labelMap = { running: "运行中", done: "已完成", archived: "历史", failed: "失败", rejected: "验收失败" };
+  box.innerHTML = "";
+  data.runs.forEach(r => {
+    const div = document.createElement("div");
+    div.className = "run-item" + (r.run_id === currentRunId ? " active" : "");
+    const req = r.requirement || "（历史任务，可查看其脚本与文档）";
+    const lineageHtml = r.base_run_id
+      ? '<div class="lineage">↻ 基于 ' + r.base_run_id + ' 迭代</div>'
+      : "";
+    div.innerHTML =
+      '<div class="rid"><button class="iter-btn" type="button">↻ 迭代修改</button>' +
+      r.run_id +
+      '<span class="badge ' + r.status + '">' + labelMap[r.status] + '</span></div>' +
+      '<div class="req"></div>' + lineageHtml;
+    div.querySelector(".req").textContent = req;
+    div.onclick = () => openRun(r.run_id);
+    // 迭代按钮阻止冒泡，避免触发“打开任务”
+    div.querySelector(".iter-btn").onclick = (e) => {
+      e.stopPropagation();
+      openIterModal(r);
+    };
+    box.appendChild(div);
+  });
+  if (selectId) await openRun(selectId, true);
+}
+
+// ---------------- 任务提交 ----------------
+$("submitBtn").onclick = async () => {
+  const requirement = $("requirement").value.trim();
+  if (!requirement) { alert("请输入需求内容"); return; }
+  const btn = $("submitBtn");
+  btn.disabled = true;
+  btn.textContent = "提交中…";
+  try {
+    const resp = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requirement })
+    });
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.detail || "提交失败"); return; }
+    currentRunId = data.run_id;
+    $("requirement").value = "";
+    await loadRuns();
+    startPolling();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "开始生成";
+  }
+};
+
+// ---------------- 基于历史任务迭代 ----------------
+let iterBaseRunId = null;
+
+function openIterModal(run) {
+  iterBaseRunId = run.run_id;
+  const info = $("iterBaseInfo");
+  info.textContent = "基线任务：" + run.run_id +
+    (run.requirement ? "\n原需求：" + run.requirement : "\n（服务重启前的历史任务，未保留原需求文本）");
+  $("iterRequirement").value = "";
+  $("iterModal").classList.add("show");
+  $("iterRequirement").focus();
+}
+
+function closeIterModal() {
+  $("iterModal").classList.remove("show");
+  iterBaseRunId = null;
+}
+
+$("iterCancel").onclick = closeIterModal;
+$("iterModal").onclick = (e) => { if (e.target === $("iterModal")) closeIterModal(); };
+
+$("iterConfirm").onclick = async () => {
+  const requirement = $("iterRequirement").value.trim();
+  if (!requirement) { alert("请描述要修改的内容"); return; }
+  const btn = $("iterConfirm");
+  btn.disabled = true;
+  btn.textContent = "提交中…";
+  try {
+    const resp = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requirement, base_run_id: iterBaseRunId })
+    });
+    const data = await resp.json();
+    if (!resp.ok) { alert(data.detail || "提交失败"); return; }
+    closeIterModal();
+    currentRunId = data.run_id;
+    await loadRuns();
+    startPolling();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "开始迭代";
+  }
+};
+
+// ---------------- 任务状态轮询 ----------------
+function startPolling() {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(pollJob, 2000);
+  pollJob();
+}
+
+async function pollJob() {
+  if (!currentRunId) return;
+  const resp = await fetch("/api/jobs/" + currentRunId);
+  if (!resp.ok) return;
+  const job = await resp.json();
+  renderJob(job);
+  loadRuns();
+  if (["done", "failed", "archived", "rejected"].includes(job.status)) {
+    clearInterval(pollTimer);
+    // 无论验收通过还是失败，都尝试加载工作区（失败时也能查看探测文件与报告）
+    await loadWorkspace(currentRunId);
+  }
+}
+
+function statusText(s) {
+  return { running: "运行中", done: "已完成", failed: "失败", archived: "历史任务", rejected: "验收失败" }[s] || s;
+}
+
+function renderJob(job) {
+  if (job.status === "archived") { loadWorkspace(job.run_id); return; }
+
+  let html = '<div class="card"><h3>任务 ' + job.run_id +
+    ' <span class="badge ' + job.status + '">' + statusText(job.status) + '</span></h3>';
+  if (job.base_run_id) {
+    html += '<div class="lineage-banner">↻ 迭代任务：基于历史任务 <b>' + job.base_run_id +
+      '</b> 的代码与文档增量修改，基线任务保持不变</div>';
+  }
+  html += '<div class="muted" style="margin-bottom:16px; max-width:700px;"></div>';
+  // 需求文本用 textContent 安全填充
+  const main = $("main");
+  main.innerHTML = html;
+  main.querySelector(".muted").textContent =
+    (job.base_run_id ? "修改要求：" : "需求：") + job.requirement;
+
+  // 步骤条
+  const steps = (job.stages || []).map((s, i) => {
+    let cls = "pending";
+    if (s.status === "done") cls = "done";
+    else if (s.status === "running") cls = job.status === "failed" ? "failed" : "running";
+    const icon = s.status === "done" ? "✓" : (i + 1);
+    return '<div class="step ' + cls + '"><div class="dot">' + icon +
+      '</div><div class="label">' + s.name + '</div></div>';
+  }).join("");
+  const stepsDiv = document.createElement("div");
+  stepsDiv.className = "steps";
+  stepsDiv.innerHTML = steps;
+  main.querySelector(".card").appendChild(stepsDiv);
+
+  if ((job.status === "failed" || job.status === "rejected") && job.error) {
+    const err = document.createElement("div");
+    err.className = "error-box";
+    err.textContent = (job.verdict_reason ? "验收结论（红灯）：\n" : "任务运行异常：\n") + job.error;
+    main.querySelector(".card").appendChild(err);
+  }
+
+  // 已完成阶段的产出
+  (job.stages || []).forEach(s => {
+    if (s.status === "done" && s.output) {
+      const det = document.createElement("details");
+      det.className = "stage-output";
+      det.innerHTML = "<summary>查看「" + s.name + "」阶段产出</summary>";
+      const pre = document.createElement("pre");
+      pre.className = "output";
+      pre.textContent = s.output;
+      det.appendChild(pre);
+      main.querySelector(".card").appendChild(det);
+    }
+  });
+}
+
+// ---------------- 文件工作区 ----------------
+async function openRun(runId, keepPolling) {
+  currentRunId = runId;
+  await loadRuns();
+  const resp = await fetch("/api/jobs/" + runId);
+  const job = await resp.json();
+  if (job.status === "running") { startPolling(); return; }
+  clearInterval(pollTimer);
+  renderJob(job);
+  await loadWorkspace(runId);
+}
+
+async function loadWorkspace(runId) {
+  const resp = await fetch("/api/runs/" + runId + "/files");
+  if (!resp.ok) { alert("无法加载任务文件"); return; }
+  const data = await resp.json();
+  if (!currentPy && data.py_files.includes("main.py")) currentPy = "main.py";
+  if (!currentPy && data.py_files.length) currentPy = data.py_files[0];
+  if (!currentMd && data.md_files.length) currentMd = data.md_files[data.md_files.length - 1];
+
+  const main = $("main");
+  // 保留进度卡片（renderJob 生成的），追加工作区卡片
+  let ws = main.querySelector("#workspaceCard");
+  if (!ws) {
+    ws = document.createElement("div");
+    ws.className = "card";
+    ws.id = "workspaceCard";
+    main.appendChild(ws);
+  }
+  ws.innerHTML = "<h3>脚本与产出</h3><div class='work-tabs' id='tabs'></div><div id='tabBody'></div>";
+  const tabs = ws.querySelector("#tabs");
+
+  const btnScript = document.createElement("button");
+  btnScript.className = "tab-btn" + (currentTab === "script" ? " active" : "");
+  btnScript.textContent = "运行脚本";
+  btnScript.onclick = () => { currentTab = "script"; renderScriptTab(data); };
+  tabs.appendChild(btnScript);
+
+  const btnDocs = document.createElement("button");
+  btnDocs.className = "tab-btn" + (currentTab === "docs" ? " active" : "");
+  btnDocs.textContent = "产出文档";
+  btnDocs.onclick = () => { currentTab = "docs"; renderDocsTab(data); };
+  tabs.appendChild(btnDocs);
+
+  if (currentTab === "docs") renderDocsTab(data); else renderScriptTab(data);
+}
+
+async function renderScriptTab(data) {
+  const body = $("tabBody");
+  if (!data.py_files.length) {
+    body.innerHTML = '<div class="muted">该任务沙箱中没有 .py 文件（可能任务未完成或失败）。</div>';
+    return;
+  }
+  body.innerHTML =
+    '<div class="row"><label>选择脚本：</label><select id="fileSelect"></select></div>' +
+    '<div class="pane-label">源码预览：</div><div class="code-view" id="codeView">加载中…</div>' +
+    '<div class="pane-label">标准输入（stdin，每行一条输入，交互式程序可用）：</div>' +
+    '<textarea id="stdin" rows="4" placeholder="例如计算器：&#10;3 + 4&#10;5 / 0&#10;q"></textarea>' +
+    '<div class="row" style="margin-top:10px;">' +
+    '<label>超时(秒)：</label><input type="number" id="timeout" value="60" min="1" max="60">' +
+    '<button class="btn btn-primary" id="runBtn" style="width:auto; margin-top:0; padding:8px 22px;">▶ 运行</button>' +
+    '<span class="muted">运行环境与 Agent 相同：允许联网；禁子进程/注册表/动态库，仅沙箱目录可写</span></div>' +
+    '<div class="exec-result" id="execResult"></div>';
+
+  const sel = $("fileSelect");
+  data.py_files.forEach(f => {
+    const opt = document.createElement("option");
+    opt.value = f; opt.textContent = f;
+    if (f === currentPy) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => { currentPy = sel.value; loadCode(); };
+  $("runBtn").onclick = runScript;
+  await loadCode();
+}
+
+async function loadCode() {
+  const resp = await fetch("/api/runs/" + currentRunId +
+    "/file?kind=sandbox&name=" + encodeURIComponent(currentPy));
+  const data = await resp.json();
+  $("codeView").textContent = data.content || "（空文件）";
+}
+
+async function runScript() {
+  const btn = $("runBtn");
+  btn.disabled = true; btn.textContent = "运行中…";
+  const out = $("execResult");
+  out.innerHTML = '<div class="muted">沙箱执行中…</div>';
+  try {
+    const resp = await fetch("/api/runs/" + currentRunId + "/exec", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: $("fileSelect").value,
+        stdin: $("stdin").value,
+        timeout: parseInt($("timeout").value, 10) || 60
+      })
+    });
+    const r = await resp.json();
+    if (r.rejected) {
+      out.innerHTML = '<div class="error-box"></div>';
+      out.querySelector(".error-box").textContent = "沙箱拒绝执行：\n" + r.reason;
+      return;
+    }
+    let html = '<div class="rc ' + (r.timed_out || r.returncode !== 0 ? "rc-bad" : "rc-ok") + '">';
+    html += r.timed_out ? "状态：<code>超时终止</code>" :
+      "退出码：<code>" + r.returncode + "</code></div>";
+    html += '<div class="pane-label">标准输出 (stdout)：</div>';
+    html += '<pre class="output" id="stdoutPane"></pre>';
+    if (r.stderr) {
+      html += '<div class="pane-label">错误输出 (stderr)：</div><pre class="output stderr" id="stderrPane"></pre>';
+    }
+    out.innerHTML = html;
+    $("stdoutPane").textContent = r.stdout || "（无输出）";
+    if (r.stderr) $("stderrPane").textContent = r.stderr;
+  } catch (e) {
+    out.innerHTML = '<div class="error-box">请求失败：' + e.message + '</div>';
+  } finally {
+    btn.disabled = false; btn.textContent = "▶ 运行";
+  }
+}
+
+async function renderDocsTab(data) {
+  const body = $("tabBody");
+  if (!data.md_files.length) {
+    body.innerHTML = '<div class="muted">该任务暂无产出文档（可能任务未完成或失败）。</div>';
+    return;
+  }
+  body.innerHTML =
+    '<div class="row"><label>选择文档：</label><select id="mdSelect"></select></div>' +
+    '<pre class="output" style="max-height:560px; margin-top:12px;" id="mdView">加载中…</pre>';
+  const sel = $("mdSelect");
+  data.md_files.forEach(f => {
+    const opt = document.createElement("option");
+    opt.value = f; opt.textContent = f;
+    if (f === currentMd) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => { currentMd = sel.value; loadMd(); };
+  await loadMd();
+}
+
+async function loadMd() {
+  const resp = await fetch("/api/runs/" + currentRunId +
+    "/file?kind=outputs&name=" + encodeURIComponent(currentMd));
+  const data = await resp.json();
+  $("mdView").textContent = data.content || "（空文档）";
+}
+
+// 初始化
+loadRuns();
+</script>
+</body>
+</html>
