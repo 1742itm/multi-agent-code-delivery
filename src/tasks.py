@@ -1,7 +1,14 @@
-"""四个顺序衔接的 Task 定义。
+"""按流程范围（scope）装配的顺序衔接 Task。
 
-流水线：需求分析 -> 代码开发（沙箱自测）-> 测试验证（沙箱）-> 最终报告。
-每个 Task 的产出同时写入 workspace/outputs/<run_id>/ 下的 Markdown 文件。
+流水线由 src/pipelines.py 定义，不再是写死的四步：
+
+- full 复杂任务：需求分析 -> 代码开发（沙箱自测）-> 测试验证（沙箱）-> 最终报告
+- lite 轻量任务：代码开发（沙箱自测）-> 测试验证（沙箱）
+
+每个 Task 的产出同时写入 workspace/outputs/<run_id>/ 下的 Markdown 文件，
+文件名由 scope 的步骤顺序派生（见 pipelines.numbered_name）。
+
+full 的描述文案与改造前逐字一致（零回归锚点，改动前已取 sha256 基线）。
 """
 
 from __future__ import annotations
@@ -11,16 +18,20 @@ from typing import Callable
 
 from crewai import Task
 
+from src.pipelines import ScopeSpec, StepSpec, base_doc_note, numbered_name
+
 # 阶段回调签名：(阶段序号 0-3, 阶段名称, TaskOutput) -> None
 StageCallback = Callable[[int, str, "object"], None]
 
 
-def _iteration_brief(role: str, info: dict) -> str:
+def _iteration_brief(role: str, info: dict, scope: ScopeSpec) -> str:
     """迭代模式下注入到各角色任务描述前的指引。
 
     info 字段均来自服务端校验/复制结果（base_run_id 经正则校验，
     文件名为沙箱安全文件名），不含用户自由文本，可安全直接拼接；
     用户的“修改要求”仍通过 {requirement} 占位符注入，避免花括号插值问题。
+
+    base_*.md 的括注按 scope 动态生成，避免轻量模式下列出不存在的文档名。
     """
     py_list = "、".join(info.get("copied_py") or []) or "（无）"
     doc_list = "、".join(info.get("copied_docs") or []) or "（无）"
@@ -32,12 +43,13 @@ def _iteration_brief(role: str, info: dict) -> str:
         "请务必结合基线资产工作，而非无视旧代码重新实现。\n"
         f"- 基线代码已复制到当前沙箱目录：{py_list}；\n"
         f"- 基线文档已复制到沙箱目录供阅读：{doc_list}"
-        "（base_requirements.md=原需求分析，base_test_report.md=原测试报告，"
-        "base_final_report.md=原最终报告）。\n"
+        + base_doc_note(scope)
+        + "\n"
         "- 开始前必须先用 sandbox_python_exec 工具（open 读取）查阅上述基线代码与文档，"
         "基于真实旧代码开展工作。\n\n"
     )
 
+    # 迭代指引：analyst / writer 只出现在 full 流程中，无需 lite 版本
     role_hints = {
         "analyst": (
             "你的任务是【变更影响分析】，输出文档须包含：\n"
@@ -82,13 +94,152 @@ def _iteration_brief(role: str, info: dict) -> str:
     return common + role_hints[role]
 
 
+# ---- 各步骤的任务正文（full 为改造前原文，逐字保留）----------------------
+
+_ANALYZE_BODY = (
+    "请对下面的用户原始需求进行结构化拆解。\n\n"
+    "用户需求：\n{requirement}\n\n"
+    "沙箱代码目录：{sandbox_dir}\n\n"
+    "输出要求（Markdown）：\n"
+    "1. 需求概述：用 2-3 句话重述需求本质；\n"
+    "2. 功能点清单：逐条列出功能点，每条包含输入、处理逻辑、输出；\n"
+    "3. 边界与异常场景：至少识别空输入、非法输入、极端值等情况；\n"
+    "4. 技术方案：模块/函数划分（给出建议的函数名、参数、返回值）、"
+    "核心数据结构、实现思路；\n"
+    "5. 验收标准：可被测试工程师直接引用的、无歧义的验收条目；\n"
+    "6. 范围外说明：明确本次不做什么，避免过度设计。\n"
+    "技术约束：沙箱允许正常网络访问（urllib/requests 等）与文件读写，"
+    "但禁止创建子进程、执行系统命令、操作注册表和沙箱目录外文件，"
+    "方案必须在这些约束内可落地、可运行验证。"
+)
+
+_DEVELOP_BODY = (
+    "请依据需求分析师的方案完成 Python 编码，并在沙箱中自测通过。\n\n"
+    "用户需求：\n{requirement}\n\n"
+    "沙箱代码目录：{sandbox_dir}\n\n"
+    "执行要求：\n"
+    "1. 使用 sandbox_python_exec 工具，将业务代码保存为 main.py；"
+    "需要时可拆分为多个 .py 文件（通过 filename 参数指定）；\n"
+    "2. 每个函数实现后立即编写自测调用并运行，覆盖正常值、边界值、异常输入；\n"
+    "3. 发现报错必须分析工具返回的错误输出，修改后重新执行，直到退出码 0；\n"
+    "4. 严禁通过任何沙箱外方式运行代码，严禁虚构执行结果；\n"
+    "5. 完成后输出实现说明（Markdown）：文件清单及职责、核心函数说明"
+    "（名称/参数/返回值/关键逻辑）、实际执行过的自测命令与真实输出摘要、"
+    "遗留限制（如有）。"
+)
+
+_TEST_BODY = (
+    "请依据需求分析师的验收标准与开发工程师的实现，在沙箱中独立编写并运行测试。\n\n"
+    "用户需求：\n{requirement}\n\n"
+    "沙箱代码目录：{sandbox_dir}（开发产出的 main.py 已在此目录）\n\n"
+    "执行要求：\n"
+    "1. 使用 sandbox_python_exec 工具新建 test_main.py，通过 import main "
+    "引入被测代码，使用 assert 或 unittest 编写测试，禁止复制被测代码；\n"
+    "2. 用例必须覆盖每条验收标准，并额外包含边界值与异常输入用例；\n"
+    "3. 在沙箱中实际运行 test_main.py；若失败，记录失败用例、复现代码、"
+    "实际输出与预期输出，并将问题如实写入报告（不得修改后谎报）；\n"
+    "4. 可重新运行验证，但最终结论必须以最后一次真实执行输出为准；\n"
+    "5. 输出测试报告（Markdown）：用例清单（编号/对应用例/类型："
+    "正常-边界-异常）、执行结果统计表（通过数/失败数/通过率）、"
+    "失败详情与复现步骤、整体质量结论。"
+)
+
+_DOCUMENT_BODY = (
+    "请整合前三份产出，生成面向交付的最终报告。\n\n"
+    "原始用户需求：\n{requirement}\n\n"
+    "沙箱代码目录：{sandbox_dir}\n\n"
+    "报告要求（Markdown）：\n"
+    "1. 项目概述与原始需求；\n"
+    "2. 功能点与技术方案摘要（以需求分析产出为准）；\n"
+    "3. 代码结构说明：文件/函数职责，以及在沙箱目录中的位置；\n"
+    "4. 核心代码片段：摘录关键函数代码（保持与沙箱中实际文件一致）；\n"
+    "5. 测试结果汇总：通过率、通过/失败用例数、已知缺陷"
+    "（严格引用测试工程师的真实结果，不得美化）；\n"
+    "6. 运行方式说明：如何在沙箱目录运行 main.py 与 test_main.py；\n"
+    "7. 交付结论：对照验收标准逐条标注达成情况。\n"
+    "全部内容必须来自前三份产出与真实执行结果，禁止虚构。"
+)
+
+# ---- 轻量流程专用正文：不能引用流程中不存在的上游产出 ----------------------
+
+_DEVELOP_BODY_LITE = (
+    "请依据用户需求直接完成 Python 编码，并在沙箱中自测通过。\n\n"
+    "用户需求：\n{requirement}\n\n"
+    "沙箱代码目录：{sandbox_dir}\n\n"
+    "执行要求：\n"
+    "1. 本流程为精简流程，没有上游的方案产出：请自行从用户需求推导模块划分与"
+    "函数接口，并把接口约定与所做的假设明确写进实现说明；\n"
+    "2. 使用 sandbox_python_exec 工具，将业务代码保存为 main.py；"
+    "需要时可拆分为多个 .py 文件（通过 filename 参数指定）；\n"
+    "3. 每个函数实现后立即编写自测调用并运行，覆盖正常值、边界值、异常输入；\n"
+    "4. 发现报错必须分析工具返回的错误输出，修改后重新执行，直到退出码 0；\n"
+    "5. 严禁通过任何沙箱外方式运行代码，严禁虚构执行结果；\n"
+    "6. 完成后输出实现说明（Markdown）：文件清单及职责、核心函数说明"
+    "（名称/参数/返回值/关键逻辑）、实际执行过的自测命令与真实输出摘要、"
+    "遗留限制（如有）。"
+)
+
+_TEST_BODY_LITE = (
+    "请在沙箱中独立编写并运行测试，客观验证开发产出的代码是否正确。\n\n"
+    "用户需求：\n{requirement}\n\n"
+    "沙箱代码目录：{sandbox_dir}（开发产出的 main.py 已在此目录）\n\n"
+    "执行要求：\n"
+    "1. 本流程为精简流程，没有上游给出的验收标准：请先依据用户需求自行"
+    "推导验收条目（正常/边界/异常），并在报告开头列出这些条目，再据此设计用例；\n"
+    "2. 使用 sandbox_python_exec 工具新建 test_main.py，通过 import main "
+    "引入被测代码，使用 assert 或 unittest 编写测试，禁止复制被测代码；\n"
+    "3. 用例必须覆盖你推导出的每条验收条目，并额外包含边界值与异常输入用例；\n"
+    "4. 在沙箱中实际运行 test_main.py；若失败，记录失败用例、复现代码、"
+    "实际输出与预期输出，并将问题如实写入报告（不得修改后谎报）；\n"
+    "5. 可重新运行验证，但最终结论必须以最后一次真实执行输出为准；\n"
+    "6. 输出测试报告（Markdown）：自行推导的验收条目清单、用例清单"
+    "（编号/对应用例/类型：正常-边界-异常）、执行结果统计表"
+    "（通过数/失败数/通过率）、失败详情与复现步骤、整体质量结论。"
+)
+
+# ---- 期望产出 --------------------------------------------------------------
+
+_EXPECTED_OUTPUT = {
+    "analyze": (
+        "一份中文 Markdown 需求分析文档，包含需求概述、功能点清单、"
+        "边界异常场景、技术方案（含函数签名）、验收标准、范围外说明六个章节。"
+    ),
+    "develop": (
+        "代码已保存在沙箱目录且自测全部退出码 0；同时输出一份中文 Markdown "
+        "实现说明，包含文件清单、核心函数说明、真实自测输出摘要与遗留限制。"
+    ),
+    "test": (
+        "test_main.py 已在沙箱中实际运行；输出一份中文 Markdown 测试报告，"
+        "包含用例清单、执行结果统计表、失败详情与客观的质量结论。"
+    ),
+    "document": (
+        "一份结构完整的中文 Markdown 最终报告，涵盖需求、方案、代码结构、"
+        "核心代码、测试结果、运行方式与验收结论，内容与上游产出一致。"
+    ),
+}
+
+
+def _step_body(step: StepSpec, scope: ScopeSpec) -> str:
+    """取该步骤在指定流程范围下的任务正文。"""
+    if step.role == "analyst":
+        return _ANALYZE_BODY
+    if step.role == "writer":
+        return _DOCUMENT_BODY
+    if step.role == "developer":
+        return _DEVELOP_BODY if scope.key == "full" else _DEVELOP_BODY_LITE
+    if step.role == "tester":
+        return _TEST_BODY if scope.key == "full" else _TEST_BODY_LITE
+    raise ValueError(f"未知角色 '{step.role}'，无法生成任务描述")
+
+
 def build_tasks(
     agents: dict,
     output_dir: Path,
+    scope: ScopeSpec,
     stage_callback: StageCallback | None = None,
     iteration_info: dict | None = None,
 ) -> list[Task]:
-    """构建四个任务。output_dir 为本轮产出目录（已存在）。
+    """按 scope 构建任务列表。output_dir 为本轮产出目录（无需预先存在）。
 
     stage_callback：每个任务完成后被调用，用于 Web 端实时更新阶段进度；
     命令行入口 main.py 不传，行为与之前完全一致。
@@ -96,11 +247,6 @@ def build_tasks(
     iteration_info：为 None 时是全新开发；传入基线信息字典时切换为迭代模式
     （基线代码/文档已由 Web 层复制进沙箱）。
     """
-
-    requirements_doc = output_dir / "01_requirements.md"
-    implementation_doc = output_dir / "02_implementation.md"
-    test_doc = output_dir / "03_test_report.md"
-    final_doc = output_dir / "04_final_report.md"
 
     def _cb(index: int, name: str):
         if stage_callback is None:
@@ -113,117 +259,26 @@ def build_tasks(
 
     def _iter(role: str) -> str:
         # 非迭代模式返回空前缀，任务描述与历史完全一致
-        return _iteration_brief(role, iteration_info) if iteration_info else ""
+        return _iteration_brief(role, iteration_info, scope) if iteration_info else ""
 
-    # ---- Task 1：需求分析 ---------------------------------------------------
-    analyze = Task(
-        description=(
-            _iter("analyst")
-            + "请对下面的用户原始需求进行结构化拆解。\n\n"
-            "用户需求：\n{requirement}\n\n"
-            "沙箱代码目录：{sandbox_dir}\n\n"
-            "输出要求（Markdown）：\n"
-            "1. 需求概述：用 2-3 句话重述需求本质；\n"
-            "2. 功能点清单：逐条列出功能点，每条包含输入、处理逻辑、输出；\n"
-            "3. 边界与异常场景：至少识别空输入、非法输入、极端值等情况；\n"
-            "4. 技术方案：模块/函数划分（给出建议的函数名、参数、返回值）、"
-            "核心数据结构、实现思路；\n"
-            "5. 验收标准：可被测试工程师直接引用的、无歧义的验收条目；\n"
-            "6. 范围外说明：明确本次不做什么，避免过度设计。\n"
-            "技术约束：沙箱允许正常网络访问（urllib/requests 等）与文件读写，"
-            "但禁止创建子进程、执行系统命令、操作注册表和沙箱目录外文件，"
-            "方案必须在这些约束内可落地、可运行验证。"
-        ),
-        expected_output=(
-            "一份中文 Markdown 需求分析文档，包含需求概述、功能点清单、"
-            "边界异常场景、技术方案（含函数签名）、验收标准、范围外说明六个章节。"
-        ),
-        agent=agents["analyst"],
-        output_file=str(requirements_doc),
-        callback=_cb(0, "需求分析"),
-    )
+    tasks_by_key: dict[str, Task] = {}
+    ordered: list[Task] = []
 
-    # ---- Task 2：代码开发（沙箱自测）---------------------------------------
-    develop = Task(
-        description=(
-            _iter("developer")
-            + "请依据需求分析师的方案完成 Python 编码，并在沙箱中自测通过。\n\n"
-            "用户需求：\n{requirement}\n\n"
-            "沙箱代码目录：{sandbox_dir}\n\n"
-            "执行要求：\n"
-            "1. 使用 sandbox_python_exec 工具，将业务代码保存为 main.py；"
-            "需要时可拆分为多个 .py 文件（通过 filename 参数指定）；\n"
-            "2. 每个函数实现后立即编写自测调用并运行，覆盖正常值、边界值、异常输入；\n"
-            "3. 发现报错必须分析工具返回的错误输出，修改后重新执行，直到退出码 0；\n"
-            "4. 严禁通过任何沙箱外方式运行代码，严禁虚构执行结果；\n"
-            "5. 完成后输出实现说明（Markdown）：文件清单及职责、核心函数说明"
-            "（名称/参数/返回值/关键逻辑）、实际执行过的自测命令与真实输出摘要、"
-            "遗留限制（如有）。"
-        ),
-        expected_output=(
-            "代码已保存在沙箱目录且自测全部退出码 0；同时输出一份中文 Markdown "
-            "实现说明，包含文件清单、核心函数说明、真实自测输出摘要与遗留限制。"
-        ),
-        agent=agents["developer"],
-        context=[analyze],
-        output_file=str(implementation_doc),
-        callback=_cb(1, "代码开发"),
-    )
+    for index, step in enumerate(scope.steps):
+        # 阶段序号与显示名同源，杜绝进度条与任务名来自两个地方
+        kwargs: dict = {
+            "description": _iter(step.role) + _step_body(step, scope),
+            "expected_output": _EXPECTED_OUTPUT[step.key],
+            "agent": agents[step.role],
+            "output_file": str(output_dir / numbered_name(index, step)),
+            "callback": _cb(index, step.title),
+        }
+        context = [tasks_by_key[key] for key in step.deps]
+        if context:
+            kwargs["context"] = context
 
-    # ---- Task 3：测试验证（沙箱）-------------------------------------------
-    test = Task(
-        description=(
-            _iter("tester")
-            + "请依据需求分析师的验收标准与开发工程师的实现，在沙箱中独立编写并运行测试。\n\n"
-            "用户需求：\n{requirement}\n\n"
-            "沙箱代码目录：{sandbox_dir}（开发产出的 main.py 已在此目录）\n\n"
-            "执行要求：\n"
-            "1. 使用 sandbox_python_exec 工具新建 test_main.py，通过 import main "
-            "引入被测代码，使用 assert 或 unittest 编写测试，禁止复制被测代码；\n"
-            "2. 用例必须覆盖每条验收标准，并额外包含边界值与异常输入用例；\n"
-            "3. 在沙箱中实际运行 test_main.py；若失败，记录失败用例、复现代码、"
-            "实际输出与预期输出，并将问题如实写入报告（不得修改后谎报）；\n"
-            "4. 可重新运行验证，但最终结论必须以最后一次真实执行输出为准；\n"
-            "5. 输出测试报告（Markdown）：用例清单（编号/对应用例/类型："
-            "正常-边界-异常）、执行结果统计表（通过数/失败数/通过率）、"
-            "失败详情与复现步骤、整体质量结论。"
-        ),
-        expected_output=(
-            "test_main.py 已在沙箱中实际运行；输出一份中文 Markdown 测试报告，"
-            "包含用例清单、执行结果统计表、失败详情与客观的质量结论。"
-        ),
-        agent=agents["tester"],
-        context=[analyze, develop],
-        output_file=str(test_doc),
-        callback=_cb(2, "测试验证"),
-    )
+        task = Task(**kwargs)
+        tasks_by_key[step.key] = task
+        ordered.append(task)
 
-    # ---- Task 4：最终报告 ---------------------------------------------------
-    document = Task(
-        description=(
-            _iter("writer")
-            + "请整合前三份产出，生成面向交付的最终报告。\n\n"
-            "原始用户需求：\n{requirement}\n\n"
-            "沙箱代码目录：{sandbox_dir}\n\n"
-            "报告要求（Markdown）：\n"
-            "1. 项目概述与原始需求；\n"
-            "2. 功能点与技术方案摘要（以需求分析产出为准）；\n"
-            "3. 代码结构说明：文件/函数职责，以及在沙箱目录中的位置；\n"
-            "4. 核心代码片段：摘录关键函数代码（保持与沙箱中实际文件一致）；\n"
-            "5. 测试结果汇总：通过率、通过/失败用例数、已知缺陷"
-            "（严格引用测试工程师的真实结果，不得美化）；\n"
-            "6. 运行方式说明：如何在沙箱目录运行 main.py 与 test_main.py；\n"
-            "7. 交付结论：对照验收标准逐条标注达成情况。\n"
-            "全部内容必须来自前三份产出与真实执行结果，禁止虚构。"
-        ),
-        expected_output=(
-            "一份结构完整的中文 Markdown 最终报告，涵盖需求、方案、代码结构、"
-            "核心代码、测试结果、运行方式与验收结论，内容与上游产出一致。"
-        ),
-        agent=agents["writer"],
-        context=[analyze, develop, test],
-        output_file=str(final_doc),
-        callback=_cb(3, "文档撰写"),
-    )
-
-    return [analyze, develop, test, document]
+    return ordered

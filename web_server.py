@@ -1,10 +1,11 @@
 """多角色协作任务 Agent —— 简易 Web 服务。
 
 职责：
-1. 接收前端提交的需求，后台串行启动 CrewAI 四角色流水线；
+1. 接收前端提交的需求与流程范围（复杂/轻量），后台串行启动 CrewAI 多角色流水线；
 2. 通过阶段回调向前端提供实时进度（前端轮询）；
 3. 列出/查看历史任务的脚本与产出文档；
-4. 在与 Agent 完全相同的安全沙箱中运行任务脚本（支持 stdin 输入）。
+4. 在与 Agent 完全相同的安全沙箱中运行任务脚本（支持 stdin 输入）；
+5. 基于历史任务迭代修改（仅限同范围）。
 
 仅绑定 127.0.0.1，不对外暴露。启动：
 
@@ -35,6 +36,18 @@ from crewai import Crew, Process
 
 from src.agents import build_agents
 from src.config import get_llm, is_api_key_configured
+from src.pipelines import (
+    DEFAULT_KEY,
+    FULL,
+    LITE,
+    ScopeSpec,
+    base_doc_map,
+    get_scope,
+    numbered_name,
+    primary_doc_name,
+    stage_names,
+    tester_report_name,
+)
 from src.tasks import build_tasks
 from src.tools import execute_sandboxed, is_safe_filename, static_check
 
@@ -47,7 +60,6 @@ OUTPUTS_ROOT = WORKSPACE_ROOT / "outputs"
 _RUN_ID_RE = re.compile(r"^\d{8}_\d{6}$")
 _STDIN_LIMIT = 4000
 _OUTPUT_LIMIT = 20000
-_STAGE_NAMES = ["需求分析", "代码开发", "测试验证", "文档撰写"]
 
 app = FastAPI(title="多角色协作任务 Agent")
 
@@ -64,9 +76,9 @@ def _is_busy() -> bool:
     return any(job["status"] == "running" for job in _jobs.values())
 
 
-def _new_stage_states() -> list[dict]:
+def _new_stage_states(scope: ScopeSpec) -> list[dict]:
     stages = [
-        {"name": name, "status": "pending", "output": ""} for name in _STAGE_NAMES
+        {"name": name, "status": "pending", "output": ""} for name in stage_names(scope)
     ]
     stages[0]["status"] = "running"
     return stages
@@ -77,13 +89,6 @@ _NON_DELIVERY_PREFIXES = ("probe", "inspect", "test_", "conclude", "read_", "ext
 
 # 迭代复制时排除的过程性/探测脚本前缀（test_main.py 等正式测试保留，供回归）
 _JUNK_PREFIXES = ("probe", "inspect", "read_", "extra_", "conclude")
-
-# 迭代时复制进新沙箱的旧文档映射（旧产出名 -> 新沙箱内参考文件名）
-_BASE_DOC_MAP = {
-    "01_requirements.md": "base_requirements.md",
-    "03_test_report.md": "base_test_report.md",
-    "04_final_report.md": "base_final_report.md",
-}
 
 
 def _load_lineage(run_id: str) -> dict:
@@ -97,12 +102,54 @@ def _load_lineage(run_id: str) -> dict:
         return {}
 
 
-def _prepare_iteration(base_run_id: str, new_sandbox: Path, new_outputs: Path) -> dict:
+def _infer_scope(run_id: str) -> str:
+    """run.json 缺失时的回退推断：无需求分析文档但有轻量流程的测试报告，判为 lite。
+
+    否则会把轻量任务按 full 回放 —— 找不到测试报告就跳过失败信号检查，
+    让实际失败的任务被回放成绿灯。
+    """
+    out_dir = OUTPUTS_ROOT / run_id
+    full_first = numbered_name(0, FULL.steps[0])
+    lite_report = tester_report_name(LITE)
+    if (
+        not (out_dir / full_first).is_file()
+        and lite_report
+        and (out_dir / lite_report).is_file()
+    ):
+        return LITE.key
+    return FULL.key
+
+
+def _load_run_meta(run_id: str) -> dict:
+    """读取任务元信息（run.json）；缺失或损坏时回退推断（老任务一律 full）。"""
+    path = OUTPUTS_ROOT / run_id / "run.json"
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {"scope": get_scope(data.get("scope")).key}
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+    return {"scope": _infer_scope(run_id)}
+
+
+def _scope_key_of(run_id: str) -> str:
+    """任务所属流程范围：运行中的任务取内存记录，历史任务读 run.json。"""
+    job = _jobs.get(run_id)
+    if job:
+        return job.get("scope", DEFAULT_KEY)
+    return _load_run_meta(run_id)["scope"]
+
+
+def _prepare_iteration(
+    base_run_id: str, new_sandbox: Path, scope: ScopeSpec
+) -> dict:
     """把历史任务的代码与文档复制到新任务沙箱，返回迭代上下文。
 
     - 业务 .py 与正式测试全部复制（探测脚本排除），开发可在旧代码上增量修改；
-    - 旧需求/测试报告/最终报告复制为 base_*.md（放在沙箱内，Agent 可直接读取）；
+    - 该范围声明为 base 的产出文档复制为 base_*.md（放在沙箱内，Agent 可直接读取）；
     - 血缘写入 outputs/<new>/iteration.json 持久化。
+
+    仅同范围迭代，故基线产出文件名与当前范围的编号规则一致。
     """
     base_sandbox = SANDBOX_ROOT / base_run_id
     base_outputs = OUTPUTS_ROOT / base_run_id
@@ -119,7 +166,7 @@ def _prepare_iteration(base_run_id: str, new_sandbox: Path, new_outputs: Path) -
 
     copied_docs: list[str] = []
     if base_outputs.is_dir():
-        for old_name, new_name in _BASE_DOC_MAP.items():
+        for old_name, new_name in base_doc_map(scope).items():
             src = base_outputs / old_name
             if src.is_file():
                 shutil.copy2(src, new_sandbox / new_name)
@@ -131,14 +178,19 @@ def _prepare_iteration(base_run_id: str, new_sandbox: Path, new_outputs: Path) -
 _FAIL_SIGNALS = ("未通过验收", "全部阻塞", "通过率 0.0%", "通过率:0.0%")
 
 
-def _evaluate_delivery(sandbox_dir: Path, output_dir: Path) -> tuple[bool, str]:
+def _evaluate_delivery(
+    sandbox_dir: Path, output_dir: Path, scope: ScopeSpec | None = None
+) -> tuple[bool, str]:
     """流水线结束后的客观交付验收。
 
     两层判定：
     1. 沙箱中必须真实存在开发交付的主脚本（main.py 优先，其次非探测类 .py）；
-    2. 测试报告中不得出现明确的验收失败结论。
+    2. 该流程范围的测试报告中不得出现明确的验收失败结论。
     返回 (是否通过, 原因说明)。
+
+    scope 不给定时按 full 处理（历史任务回放依赖此默认值）。
     """
+    scope = scope if scope is not None else FULL
     py_files = sorted(
         p.name
         for p in sandbox_dir.iterdir()
@@ -165,8 +217,9 @@ def _evaluate_delivery(sandbox_dir: Path, output_dir: Path) -> tuple[bool, str]:
     if (sandbox_dir / delivery).stat().st_size == 0:
         return False, f"验收失败：交付脚本 {delivery} 为空文件。"
 
-    test_report = output_dir / "03_test_report.md"
-    if test_report.is_file():
+    report_name = tester_report_name(scope)
+    test_report = output_dir / report_name if report_name else None
+    if test_report is not None and test_report.is_file():
         content = test_report.read_text(encoding="utf-8", errors="replace")
         hit = next((sig for sig in _FAIL_SIGNALS if sig in content), None)
         if hit:
@@ -183,6 +236,7 @@ def _run_crew(
     requirement: str,
     sandbox_dir: Path,
     output_dir: Path,
+    scope: ScopeSpec,
     iteration_info: dict | None = None,
 ) -> None:
     """后台线程：构建并运行 Crew，通过回调更新阶段状态。"""
@@ -206,17 +260,13 @@ def _run_crew(
         tasks = build_tasks(
             agents,
             output_dir,
+            scope,
             stage_callback=on_stage,
             iteration_info=iteration_info,
         )
 
         crew = Crew(
-            agents=[
-                agents["analyst"],
-                agents["developer"],
-                agents["tester"],
-                agents["writer"],
-            ],
+            agents=[agents[step.role] for step in scope.steps],
             tasks=tasks,
             process=Process.sequential,
             verbose=False,
@@ -229,7 +279,7 @@ def _run_crew(
             }
         )
         # 流程走完 ≠ 交付成功：必须通过客观验收（主脚本落盘 + 测试报告无失败结论）
-        accepted, reason = _evaluate_delivery(sandbox_dir, output_dir)
+        accepted, reason = _evaluate_delivery(sandbox_dir, output_dir, scope)
         with _jobs_lock:
             job["verdict_reason"] = reason
             if accepted:
@@ -251,6 +301,7 @@ def _run_crew(
 class RequirementBody(BaseModel):
     requirement: str = Field(..., min_length=1, max_length=4000)
     base_run_id: str | None = Field(default=None, max_length=20)
+    scope: str | None = Field(default=None, max_length=20)
 
 
 class ExecBody(BaseModel):
@@ -294,9 +345,13 @@ def _scan_runs() -> list[dict]:
             status = job["status"]
             requirement = job["requirement"]
             base_run_id = job.get("base_run_id")
+            scope_key = job.get("scope", DEFAULT_KEY)
         else:
             # 服务重启后的历史任务：实时回放客观验收，失败任务保持红灯
-            accepted, _ = _evaluate_delivery(SANDBOX_ROOT / rid, OUTPUTS_ROOT / rid)
+            scope_key = _load_run_meta(rid)["scope"]
+            accepted, _ = _evaluate_delivery(
+                SANDBOX_ROOT / rid, OUTPUTS_ROOT / rid, get_scope(scope_key)
+            )
             status = "archived" if accepted else "rejected"
             requirement = ""
             base_run_id = _load_lineage(rid).get("base_run_id")
@@ -306,6 +361,7 @@ def _scan_runs() -> list[dict]:
                 "status": status,
                 "requirement": requirement,
                 "base_run_id": base_run_id,
+                "scope": scope_key,
                 "has_sandbox": rid in sandbox_ids,
                 "has_outputs": rid in output_ids,
             }
@@ -375,6 +431,22 @@ def create_job(body: RequirementBody):
         ).is_dir():
             raise HTTPException(status_code=404, detail="基线任务不存在，无法迭代")
 
+    # 流程范围校验：必须在建目录之前完成，避免留下空目录变成僵尸任务
+    try:
+        scope = get_scope(body.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 仅支持同范围迭代：跨范围会缺少对应范围的基线文档，提示词必然自相矛盾
+    if base_run_id is not None:
+        base_scope = get_scope(_scope_key_of(base_run_id))
+        if base_scope.key != scope.key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前仅支持基于同范围任务的迭代：基线任务为「{base_scope.title}」，"
+                f"本次选择的是「{scope.title}」，请改用与基线一致的范围。",
+            )
+
     with _jobs_lock:
         if _is_busy():
             raise HTTPException(status_code=409, detail="已有任务正在运行，请等待完成后再提交")
@@ -392,7 +464,7 @@ def create_job(body: RequirementBody):
         # 迭代模式：复制基线代码与参考文档，构造 Crew 迭代上下文
         iteration_info = None
         if base_run_id is not None:
-            assets = _prepare_iteration(base_run_id, sandbox_dir, output_dir)
+            assets = _prepare_iteration(base_run_id, sandbox_dir, scope)
             if not assets["copied_py"] and not assets["copied_docs"]:
                 # 基线目录存在但完全是空壳，拒绝并清理新建目录
                 shutil.rmtree(sandbox_dir, ignore_errors=True)
@@ -420,6 +492,20 @@ def create_job(body: RequirementBody):
                 encoding="utf-8",
             )
 
+        # 任务元信息持久化（服务重启后回放验收与列表展示都依赖它）
+        (output_dir / "run.json").write_text(
+            json.dumps(
+                {
+                    "scope": scope.key,
+                    "requirement": requirement,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
         _jobs[run_id] = {
             "run_id": run_id,
             "requirement": requirement,
@@ -427,17 +513,18 @@ def create_job(body: RequirementBody):
             "error": "",
             "verdict_reason": "",
             "base_run_id": base_run_id,
+            "scope": scope.key,
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "stages": _new_stage_states(),
+            "stages": _new_stage_states(scope),
         }
 
     thread = threading.Thread(
         target=_run_crew,
-        args=(run_id, requirement, sandbox_dir, output_dir, iteration_info),
+        args=(run_id, requirement, sandbox_dir, output_dir, scope, iteration_info),
         daemon=True,
     )
     thread.start()
-    return {"run_id": run_id, "base_run_id": base_run_id}
+    return {"run_id": run_id, "base_run_id": base_run_id, "scope": scope.key}
 
 
 @app.get("/api/jobs/{run_id}")
@@ -448,8 +535,9 @@ def get_job(run_id: str):
     if not job:
         # 可能是历史任务（服务重启后内存中无记录）：回放验收结论
         if (SANDBOX_ROOT / run_id).is_dir() or (OUTPUTS_ROOT / run_id).is_dir():
+            scope_key = _scope_key_of(run_id)
             accepted, reason = _evaluate_delivery(
-                SANDBOX_ROOT / run_id, OUTPUTS_ROOT / run_id
+                SANDBOX_ROOT / run_id, OUTPUTS_ROOT / run_id, get_scope(scope_key)
             )
             lineage = _load_lineage(run_id)
             return {
@@ -460,6 +548,7 @@ def get_job(run_id: str):
                 "verdict_reason": reason,
                 "requirement": lineage.get("change_request", ""),
                 "base_run_id": lineage.get("base_run_id"),
+                "scope": scope_key,
             }
         raise HTTPException(status_code=404, detail="任务不存在")
     return job
@@ -468,10 +557,13 @@ def get_job(run_id: str):
 @app.get("/api/runs/{run_id}/files")
 def list_files(run_id: str):
     _validate_run_id(run_id)
+    scope = get_scope(_scope_key_of(run_id))
     return {
         "run_id": run_id,
+        "scope": scope.key,
         "py_files": _list_py_files(SANDBOX_ROOT / run_id),
         "md_files": _list_md_files(run_id),
+        "primary_doc": primary_doc_name(scope),
     }
 
 

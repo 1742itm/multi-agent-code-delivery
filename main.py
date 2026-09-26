@@ -97,15 +97,10 @@ def main() -> None:
 
     llm = get_llm()
     agents = build_agents(llm)
-    tasks = build_tasks(agents, output_dir)
+    tasks = build_tasks(agents, output_dir, get_scope("full"))
 
     crew = Crew(
-        agents=[
-            agents["analyst"],
-            agents["developer"],
-            agents["tester"],
-            agents["writer"],
-        ],
+        agents=[agents[step.role] for step in get_scope("full").steps],
         tasks=tasks,
         process=Process.sequential,
         verbose=True,

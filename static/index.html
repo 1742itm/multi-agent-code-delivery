@@ -63,6 +63,24 @@
     padding: 6px 12px; font-size: 13px;
   }
   .btn-ghost:hover { border-color: var(--blue); color: var(--blue); }
+
+  /* 流程范围选择（复杂 / 轻量） */
+  .mode-picker {
+    display: flex; gap: 6px; margin-bottom: 8px;
+    background: #f1f5f9; border-radius: 8px; padding: 4px;
+  }
+  .mode-btn {
+    flex: 1; border: none; background: transparent; border-radius: 6px;
+    padding: 7px 8px; font-size: 13px; font-family: inherit; color: var(--gray);
+    cursor: pointer; transition: background .15s, color .15s;
+  }
+  .mode-btn:hover { color: var(--blue); }
+  .mode-btn.active {
+    background: #fff; color: var(--blue); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .06);
+  }
+  .mode-btn:disabled { opacity: .6; cursor: not-allowed; }
+
   .hint { font-size: 12px; color: var(--gray); margin-top: 8px; line-height: 1.5; }
 
   .runs { flex: 1; overflow-y: auto; padding: 8px; }
@@ -84,6 +102,7 @@
   .badge.running { background: #dbeafe; color: var(--blue); }
   .badge.done, .badge.archived { background: #dcfce7; color: var(--green); }
   .badge.failed, .badge.rejected { background: #fee2e2; color: var(--red); }
+  .badge.lite { background: #e0e7ff; color: #4338ca; }
 
   /* 迭代按钮与血缘 */
   .iter-btn {
@@ -214,7 +233,7 @@
   <div class="logo">Agent</div>
   <div>
     <h1>多角色协作任务 Agent</h1>
-    <div class="sub">需求分析师 → 代码开发 → 测试验证 → 文档撰写　|　全部代码在安全沙箱中执行</div>
+    <div class="sub">复杂 / 轻量两种流程可选　|　全部代码在安全沙箱中执行</div>
   </div>
 </header>
 
@@ -222,9 +241,14 @@
   <aside>
     <div class="aside-section">
       <h2>提交新需求</h2>
+      <div class="mode-picker" id="scopePicker">
+        <button class="mode-btn active" type="button" data-scope="full">复杂任务</button>
+        <button class="mode-btn" type="button" data-scope="lite">轻量任务</button>
+      </div>
+      <div class="hint" id="scopeHint" style="margin-top:0; margin-bottom:8px;"></div>
       <textarea id="requirement" rows="5" placeholder="例如：实现一个支持加减乘除与除零保护的命令行计算器"></textarea>
       <button class="btn btn-primary" id="submitBtn">开始生成</button>
-      <div class="hint">任务运行约需数分钟，期间四个角色会顺序协作；同一时间只运行一个任务。</div>
+      <div class="hint">任务运行约需数分钟，期间角色会顺序协作；同一时间只运行一个任务。</div>
     </div>
     <div class="aside-section" style="border-bottom:none; padding-bottom:6px;">
       <h2>历史任务</h2>
@@ -247,10 +271,12 @@
   <div class="modal">
     <h3>基于历史任务迭代修改</h3>
     <div class="base-info" id="iterBaseInfo"></div>
+    <div class="hint" id="iterScopeInfo" style="margin-top:0; margin-bottom:10px;"></div>
     <textarea id="iterRequirement" rows="6"
       placeholder="描述你要在这个版本基础上做的修改，例如：为计算器增加取模（%）和幂运算（^）"></textarea>
-    <div class="hint">系统会把基线任务的代码、原需求分析、测试报告与最终报告复制到新沙箱，
-      开发将在旧代码上增量修改、测试会做回归验证；基线任务保持不变。</div>
+    <div class="hint">系统会把基线任务的代码与该流程范围的产出文档复制到新沙箱，
+      开发将在旧代码上增量修改、测试会做回归验证；基线任务保持不变。
+      迭代沿用基线任务所属的流程范围，不支持跨范围迭代。</div>
     <div class="actions">
       <button class="btn btn-ghost" id="iterCancel">取消</button>
       <button class="btn btn-warn" id="iterConfirm">开始迭代</button>
@@ -284,10 +310,12 @@ async function loadRuns(selectId) {
     const lineageHtml = r.base_run_id
       ? '<div class="lineage">↻ 基于 ' + r.base_run_id + ' 迭代</div>'
       : "";
+    const scopeBadge = r.scope === "lite" ? '<span class="badge lite">轻量</span>' : "";
     div.innerHTML =
       '<div class="rid"><button class="iter-btn" type="button">↻ 迭代修改</button>' +
       r.run_id +
-      '<span class="badge ' + r.status + '">' + labelMap[r.status] + '</span></div>' +
+      '<span class="badge ' + r.status + '">' + labelMap[r.status] + '</span>' +
+      scopeBadge + '</div>' +
       '<div class="req"></div>' + lineageHtml;
     div.querySelector(".req").textContent = req;
     div.onclick = () => openRun(r.run_id);
@@ -301,6 +329,26 @@ async function loadRuns(selectId) {
   if (selectId) await openRun(selectId, true);
 }
 
+// ---------------- 流程范围选择（复杂 / 轻量） ----------------
+const SCOPE_HINTS = {
+  full: "复杂任务：需求分析 → 代码开发 → 测试验证 → 文档撰写，产出 4 份文档。",
+  lite: "轻量任务：代码开发 → 测试验证，产出实现说明与测试报告。"
+};
+let currentScope = "full";
+
+function setScope(scope) {
+  currentScope = scope;
+  document.querySelectorAll("#scopePicker .mode-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.scope === scope);
+  });
+  $("scopeHint").textContent = SCOPE_HINTS[scope] || "";
+}
+
+document.querySelectorAll("#scopePicker .mode-btn").forEach(b => {
+  b.onclick = () => setScope(b.dataset.scope);
+});
+setScope("full");
+
 // ---------------- 任务提交 ----------------
 $("submitBtn").onclick = async () => {
   const requirement = $("requirement").value.trim();
@@ -312,7 +360,7 @@ $("submitBtn").onclick = async () => {
     const resp = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requirement })
+      body: JSON.stringify({ requirement, scope: currentScope })
     });
     const data = await resp.json();
     if (!resp.ok) { alert(data.detail || "提交失败"); return; }
@@ -328,12 +376,18 @@ $("submitBtn").onclick = async () => {
 
 // ---------------- 基于历史任务迭代 ----------------
 let iterBaseRunId = null;
+let iterScope = "full";
 
 function openIterModal(run) {
   iterBaseRunId = run.run_id;
+  // 迭代沿用基线的流程范围（服务端仅支持同范围迭代）
+  iterScope = run.scope === "lite" ? "lite" : "full";
   const info = $("iterBaseInfo");
   info.textContent = "基线任务：" + run.run_id +
     (run.requirement ? "\n原需求：" + run.requirement : "\n（服务重启前的历史任务，未保留原需求文本）");
+  $("iterScopeInfo").textContent = "流程范围：" +
+    (iterScope === "lite" ? "轻量任务" : "复杂任务") +
+    "（沿用基线任务的范围，不可更改）";
   $("iterRequirement").value = "";
   $("iterModal").classList.add("show");
   $("iterRequirement").focus();
@@ -357,7 +411,7 @@ $("iterConfirm").onclick = async () => {
     const resp = await fetch("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requirement, base_run_id: iterBaseRunId })
+      body: JSON.stringify({ requirement, base_run_id: iterBaseRunId, scope: iterScope })
     });
     const data = await resp.json();
     if (!resp.ok) { alert(data.detail || "提交失败"); return; }
@@ -388,6 +442,9 @@ async function pollJob() {
   if (["done", "failed", "archived", "rejected"].includes(job.status)) {
     clearInterval(pollTimer);
     // 无论验收通过还是失败，都尝试加载工作区（失败时也能查看探测文件与报告）
+    // 同样先重置选中项，避免沿用上一个任务的脚本/文档名
+    currentPy = null;
+    currentMd = null;
     await loadWorkspace(currentRunId);
   }
 }
@@ -451,6 +508,9 @@ function renderJob(job) {
 // ---------------- 文件工作区 ----------------
 async function openRun(runId, keepPolling) {
   currentRunId = runId;
+  // 切换任务时重置选中项：否则会沿用上一个任务的脚本/文档名（full→lite 时必然 404）
+  currentPy = null;
+  currentMd = null;
   await loadRuns();
   const resp = await fetch("/api/jobs/" + runId);
   const job = await resp.json();
@@ -466,7 +526,12 @@ async function loadWorkspace(runId) {
   const data = await resp.json();
   if (!currentPy && data.py_files.includes("main.py")) currentPy = "main.py";
   if (!currentPy && data.py_files.length) currentPy = data.py_files[0];
-  if (!currentMd && data.md_files.length) currentMd = data.md_files[data.md_files.length - 1];
+  if (!currentMd && data.md_files.length) {
+    // 优先用服务端给出的主交付文档（复杂=最终报告，轻量=测试报告）
+    currentMd = (data.primary_doc && data.md_files.includes(data.primary_doc))
+      ? data.primary_doc
+      : data.md_files[data.md_files.length - 1];
+  }
 
   const main = $("main");
   // 保留进度卡片（renderJob 生成的），追加工作区卡片
