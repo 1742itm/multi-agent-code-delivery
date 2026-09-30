@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import os
+import runpy
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -145,22 +146,25 @@ def main() -> int:
 
     sys.addaudithook(_audit_hook)
 
-    # 让用户脚本能 import 同一沙箱目录内的其他文件（多文件协作）
-    sys.path.insert(0, str(USER_FILE.parent))
+    # 依赖搜索路径（顺序即优先级）：脚本所在目录 -> 沙箱 src/（业务代码）->
+    # 沙箱根目录（兼容历史扁平结构）。这样 tests/test_main.py 里的
+    # `import main` 会命中 src/main.py，而根目录残留在最末，遮蔽面最小。
+    for extra in (SANDBOX_DIR, SANDBOX_DIR / "src", USER_FILE.parent):
+        if extra.is_dir() and str(extra) not in sys.path:
+            sys.path.insert(0, str(extra))
 
-    source = USER_FILE.read_text(encoding="utf-8")
-    compiled = compile(source, str(USER_FILE), "exec")
-
-    user_globals = {
-        "__name__": "__main__",
-        "__file__": str(USER_FILE),
-    }
+    # 按 `python <script>` 的语义提供 argv：不带 runner 自身的参数，
+    # 否则被测程序里的 argparse 会因多出位置参数而直接退出
+    sys.argv = [str(USER_FILE)]
 
     stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            exec(compiled, user_globals)  # noqa: S102
-    except SystemExit as exc:  # 用户代码调用 sys.exit 被禁后理论上到不了这里
+            # 必须用 runpy：它会让 sys.modules["__main__"] 临时指向用户脚本，
+            # unittest.main() 才能真正收集到用例；用 exec 执行时
+            # sys.modules["__main__"] 仍是本 runner，会跑 0 个用例并退出 0
+            runpy.run_path(str(USER_FILE), run_name="__main__")
+    except SystemExit as exc:  # 用户代码调用 sys.exit
         code = exc.code if isinstance(exc.code, int) else 1
         _dump(stdout_buf, stderr_buf)
         return int(code or 0)

@@ -524,6 +524,10 @@ async function loadWorkspace(runId) {
   const resp = await fetch("/api/runs/" + runId + "/files");
   if (!resp.ok) { alert("无法加载任务文件"); return; }
   const data = await resp.json();
+  if (!currentPy && data.primary_script && data.py_files.includes(data.primary_script)) {
+    // 优先用服务端定位到的交付主脚本（复杂/轻量、新旧目录结构都适用）
+    currentPy = data.primary_script;
+  }
   if (!currentPy && data.py_files.includes("main.py")) currentPy = "main.py";
   if (!currentPy && data.py_files.length) currentPy = data.py_files[0];
   if (!currentMd && data.md_files.length) {

@@ -27,6 +27,7 @@ from crewai import Crew, Process
 
 from src.agents import build_agents
 from src.config import PROJECT_ROOT, get_llm, is_api_key_configured
+from src.pipelines import get_scope
 from src.tasks import build_tasks
 
 WORKSPACE_ROOT = PROJECT_ROOT / "workspace"
@@ -97,10 +98,11 @@ def main() -> None:
 
     llm = get_llm()
     agents = build_agents(llm)
-    tasks = build_tasks(agents, output_dir, get_scope("full"))
+    scope = get_scope("full")
+    tasks = build_tasks(agents, output_dir, scope)
 
     crew = Crew(
-        agents=[agents[step.role] for step in get_scope("full").steps],
+        agents=[agents[step.role] for step in scope.steps],
         tasks=tasks,
         process=Process.sequential,
         verbose=True,

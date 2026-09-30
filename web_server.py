@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import json
@@ -87,9 +88,6 @@ def _new_stage_states(scope: ScopeSpec) -> list[dict]:
 # 探测/调试/测试类文件名前缀，不作为“开发交付主脚本”
 _NON_DELIVERY_PREFIXES = ("probe", "inspect", "test_", "conclude", "read_", "extra_")
 
-# 迭代复制时排除的过程性/探测脚本前缀（test_main.py 等正式测试保留，供回归）
-_JUNK_PREFIXES = ("probe", "inspect", "read_", "extra_", "conclude")
-
 
 def _load_lineage(run_id: str) -> dict:
     """读取任务血缘文件（服务重启后仍可获知其基于哪个历史任务迭代）。"""
@@ -121,12 +119,18 @@ def _infer_scope(run_id: str) -> str:
 
 
 def _load_run_meta(run_id: str) -> dict:
-    """读取任务元信息（run.json）；缺失或损坏时回退推断（老任务一律 full）。"""
+    """读取任务元信息（run.json）；缺失或损坏时回退推断（老任务一律 full）。
+
+    返回 dict，可能含 scope 与 verification 两个键。
+    """
     path = OUTPUTS_ROOT / run_id / "run.json"
     if path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return {"scope": get_scope(data.get("scope")).key}
+            meta = {"scope": get_scope(data.get("scope")).key}
+            if isinstance(data.get("verification"), dict):
+                meta["verification"] = data["verification"]
+            return meta
         except (json.JSONDecodeError, OSError, ValueError):
             pass
     return {"scope": _infer_scope(run_id)}
@@ -145,24 +149,26 @@ def _prepare_iteration(
 ) -> dict:
     """把历史任务的代码与文档复制到新任务沙箱，返回迭代上下文。
 
-    - 业务 .py 与正式测试全部复制（探测脚本排除），开发可在旧代码上增量修改；
-    - 该范围声明为 base 的产出文档复制为 base_*.md（放在沙箱内，Agent 可直接读取）；
-    - 血缘写入 outputs/<new>/iteration.json 持久化。
+    - 基线已是 src/ + tests/ 结构：直接复制这两棵子树；
+    - 基线是历史扁平结构：按**静态 import 闭包**挑选业务文件归入 src/，
+      把正式测试归入 tests/，探测/调试类脚本一律不带过去；
+    - 该范围声明为 base 的产出文档复制为 base_*.md（放在沙箱内，Agent 可直接读取）。
 
     仅同范围迭代，故基线产出文件名与当前范围的编号规则一致。
     """
     base_sandbox = SANDBOX_ROOT / base_run_id
     base_outputs = OUTPUTS_ROOT / base_run_id
 
-    copied_py: list[str] = []
-    if base_sandbox.is_dir():
-        for p in sorted(base_sandbox.iterdir()):
-            if not (p.is_file() and p.suffix == ".py"):
-                continue
-            if p.name.startswith(_JUNK_PREFIXES):
-                continue
-            shutil.copy2(p, new_sandbox / p.name)
-            copied_py.append(p.name)
+    copied_src: list[str] = []
+    copied_tests: list[str] = []
+
+    if (base_sandbox / "src").is_dir():
+        copied_src = _copy_tree(base_sandbox / "src", new_sandbox / "src")
+        copied_tests = _copy_tree(base_sandbox / "tests", new_sandbox / "tests")
+    elif base_sandbox.is_dir():
+        copied_src, copied_tests = _bridge_flat_baseline(
+            base_sandbox, new_sandbox
+        )
 
     copied_docs: list[str] = []
     if base_outputs.is_dir():
@@ -172,46 +178,232 @@ def _prepare_iteration(
                 shutil.copy2(src, new_sandbox / new_name)
                 copied_docs.append(new_name)
 
-    return {"copied_py": copied_py, "copied_docs": copied_docs}
+    return {
+        "copied_src": copied_src,
+        "copied_tests": copied_tests,
+        "copied_docs": copied_docs,
+    }
+
+
+def _copy_tree(src_dir: Path, dst_dir: Path) -> list[str]:
+    """复制某个单层目录下的全部 .py（只取单层，与沙箱命名规则一致）。"""
+    if not src_dir.is_dir():
+        return []
+    copied: list[str] = []
+    for p in sorted(src_dir.iterdir()):
+        if not (p.is_file() and p.suffix == ".py" and is_safe_filename(p.name)):
+            continue
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dst_dir / p.name)
+        copied.append(p.name)
+    return copied
+
+
+def _import_closure(base_sandbox: Path, entries: list[str]) -> list[str]:
+    """静态解析入口文件的 import，收集沙箱根目录下的同名 .py，迭代到不动点。
+
+    历史扁平沙箱里混杂着大量探测脚本，用前缀猜法挑不干净；按 import 关系
+    反推业务文件更准。解析失败的文件直接保留自身，不做猜测。
+    """
+    seen: list[str] = []
+    pending = list(entries)
+    while pending:
+        rel = pending.pop()
+        if rel in seen:
+            continue
+        seen.append(rel)
+        path = base_sandbox / rel
+        if not path.is_file():
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name.split(".")[0] for alias in node.names]
+            elif (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module
+            ):
+                names = [node.module.split(".")[0]]
+            else:
+                continue
+            for name in names:
+                cand = f"{name}.py"
+                if (base_sandbox / cand).is_file() and cand not in seen:
+                    pending.append(cand)
+    return sorted(seen)
+
+
+def _bridge_flat_baseline(
+    base_sandbox: Path, new_sandbox: Path
+) -> tuple[list[str], list[str]]:
+    """把历史扁平基线桥接成 src/ + tests/ 结构，返回 (业务文件, 测试文件)。"""
+    delivery, _ = _locate_delivery(base_sandbox)
+    test_entry = _locate_test_entry(base_sandbox)
+
+    # 正式测试：入口测试 + 其余正式 test_*.py（排除过程性/备份文件）
+    test_names = sorted(
+        p.name
+        for p in base_sandbox.iterdir()
+        if p.is_file()
+        and p.name.startswith("test_")
+        and p.suffix == ".py"
+        and not p.name.endswith(_TEST_ENTRY_EXCLUDE)
+    )
+
+    closure = _import_closure(
+        base_sandbox, [n for n in (delivery, test_entry) if n]
+    )
+    src_names = [n for n in closure if n not in test_names]
+
+    copied_src: list[str] = []
+    for name in src_names:
+        src = base_sandbox / name
+        if not (src.is_file() and is_safe_filename(name)):
+            continue
+        (new_sandbox / "src").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, new_sandbox / "src" / name)
+        copied_src.append(name)
+
+    copied_tests: list[str] = []
+    for name in test_names:
+        src = base_sandbox / name
+        if not (src.is_file() and is_safe_filename(name)):
+            continue
+        (new_sandbox / "tests").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, new_sandbox / "tests" / name)
+        copied_tests.append(name)
+
+    return copied_src, copied_tests
 
 # 测试报告中代表验收失败的明确信号
 _FAIL_SIGNALS = ("未通过验收", "全部阻塞", "通过率 0.0%", "通过率:0.0%")
+
+# 服务端独立复跑正式测试的配置
+_VERIFY_TIMEOUT = 60
+_VERIFY_TAIL = 2000
+# unittest 明确跑 0 个用例的信号（属无效证据，不能算通过）
+_RAN_ZERO_SIGNAL = "Ran 0 tests"
+
+
+# 正式测试脚本的排除后缀（过程性/备份文件，不作为独立复跑的入口）
+_TEST_ENTRY_EXCLUDE = ("_backup.py", "_check.py")
+
+
+def _rel_py_files(sandbox_dir: Path, subdir: str) -> list[str]:
+    """列出沙箱下某个单层子目录的 .py（相对 POSIX 路径，已排序）。"""
+    target = sandbox_dir / subdir if subdir else sandbox_dir
+    if not target.is_dir():
+        return []
+    return sorted(
+        f"{subdir}/{p.name}" if subdir else p.name
+        for p in target.iterdir()
+        if p.is_file() and p.suffix == ".py"
+    )
+
+
+def _is_delivery_name(rel_path: str) -> bool:
+    """是否可能是开发交付的业务脚本（只看文件名前缀，不看所在目录）。"""
+    return not Path(rel_path).name.startswith(_NON_DELIVERY_PREFIXES)
+
+
+def _locate_delivery(sandbox_dir: Path) -> tuple[str | None, str]:
+    """定位开发交付的主脚本，返回 (相对路径, 失败原因)；成功时原因为空串。
+
+    优先新目录约定 src/，再兼容历史扁平结构（历史任务的结论必须逐字不变，
+    因此根目录回退分支保持改造前的行为）。
+    """
+    if not sandbox_dir.is_dir():
+        return None, "验收失败：任务沙箱目录不存在。"
+
+    if (sandbox_dir / "src" / "main.py").is_file():
+        return "src/main.py", ""
+    if (sandbox_dir / "main.py").is_file():
+        return "main.py", ""
+
+    # 新约定回退：src/ 下若只有一个业务脚本才认为它是交付，多于一个宁可判红
+    src_candidates = [
+        f for f in _rel_py_files(sandbox_dir, "src") if _is_delivery_name(f)
+    ]
+    if len(src_candidates) == 1:
+        return src_candidates[0], ""
+    if len(src_candidates) > 1:
+        names = "、".join(Path(f).name for f in src_candidates)
+        return None, (
+            f"验收失败：未找到 src/main.py，且 src/ 下存在多个业务脚本（{names}），"
+            "无法确定交付主脚本。"
+        )
+
+    # 历史扁平结构回退：根目录非探测类第一个（与改造前一致）
+    root_files = _rel_py_files(sandbox_dir, "")
+    root_candidates = [n for n in root_files if _is_delivery_name(n)]
+    if not root_candidates:
+        return None, (
+            "验收失败：沙箱目录中未找到开发交付的主脚本（main.py 或其他业务 .py），"
+            f"仅有 {len(root_files)} 个探测/测试类文件，开发产出未真实落盘。"
+        )
+    return root_candidates[0], ""
+
+
+def _locate_test_entry(sandbox_dir: Path) -> str | None:
+    """定位正式测试脚本（相对路径）；找不到返回 None。"""
+
+    def _pick(files: list[str]) -> str | None:
+        if not files:
+            return None
+        for rel in files:
+            if Path(rel).name == "test_main.py":
+                return rel
+        return files[0]
+
+    for subdir in ("tests", ""):
+        files = [
+            rel
+            for rel in _rel_py_files(sandbox_dir, subdir)
+            if Path(rel).name.startswith("test_")
+            and not Path(rel).name.endswith(_TEST_ENTRY_EXCLUDE)
+        ]
+        picked = _pick(files)
+        if picked:
+            return picked
+    return None
+
+
+def _verdict_for(run_id: str) -> tuple[bool, str]:
+    """任务验收结论：优先用 run.json 里持久化的复跑结果，否则回退旧判据。
+
+    历史任务没有 verification 字段，一律走旧判据且**不执行任何代码** ——
+    这是历史回放结论逐字不变、且沙箱零写回的保证。
+    """
+    meta = _load_run_meta(run_id)
+    verification = meta.get("verification")
+    if isinstance(verification, dict):
+        return bool(verification.get("ok")), str(verification.get("reason") or "")
+    return _evaluate_delivery(
+        SANDBOX_ROOT / run_id, OUTPUTS_ROOT / run_id, get_scope(meta["scope"])
+    )
 
 
 def _evaluate_delivery(
     sandbox_dir: Path, output_dir: Path, scope: ScopeSpec | None = None
 ) -> tuple[bool, str]:
-    """流水线结束后的客观交付验收。
+    """旧版（报告信号）客观验收 —— 供历史任务回放使用。
 
     两层判定：
-    1. 沙箱中必须真实存在开发交付的主脚本（main.py 优先，其次非探测类 .py）；
+    1. 沙箱中必须真实存在开发交付的主脚本（src/main.py 或历史结构的 main.py）；
     2. 该流程范围的测试报告中不得出现明确的验收失败结论。
     返回 (是否通过, 原因说明)。
 
     scope 不给定时按 full 处理（历史任务回放依赖此默认值）。
     """
     scope = scope if scope is not None else FULL
-    py_files = sorted(
-        p.name
-        for p in sandbox_dir.iterdir()
-        if p.is_file() and p.suffix == ".py"
-    ) if sandbox_dir.is_dir() else []
 
-    main_file = sandbox_dir / "main.py"
-    if main_file.is_file():
-        delivery = "main.py"
-    else:
-        candidates = [
-            name
-            for name in py_files
-            if not name.startswith(_NON_DELIVERY_PREFIXES)
-        ]
-        if not candidates:
-            return False, (
-                "验收失败：沙箱目录中未找到开发交付的主脚本（main.py 或其他业务 .py），"
-                f"仅有 {len(py_files)} 个探测/测试类文件，开发产出未真实落盘。"
-            )
-        delivery = candidates[0]
+    delivery, reason = _locate_delivery(sandbox_dir)
+    if delivery is None:
+        return False, reason
 
     # 主脚本为空文件也视为无效交付
     if (sandbox_dir / delivery).stat().st_size == 0:
@@ -229,6 +421,114 @@ def _evaluate_delivery(
             )
 
     return True, f"验收通过：交付脚本 {delivery} 已落盘，测试报告未报告失败结论。"
+
+
+def _read_run_json(run_id: str) -> dict:
+    path = OUTPUTS_ROOT / run_id / "run.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_run_json(run_id: str, **fields) -> None:
+    """读-改-写合并 run.json（保留 scope/requirement/created_at）。
+
+    任何异常都不得影响流水线结果，因此静默吞掉 IO 错误。
+    """
+    path = OUTPUTS_ROOT / run_id / "run.json"
+    try:
+        data = _read_run_json(run_id)
+        data.update(fields)
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _run_verification(
+    sandbox_dir: Path, output_dir: Path, scope: ScopeSpec
+) -> tuple[bool, str, dict]:
+    """服务端独立复跑正式测试，返回 (是否通过, 原因说明, 证据)。
+
+    只在流水线结束时调用一次（历史回放走 `_verdict_for` 读持久化结论，不经过这里）。
+    判定优先级：主脚本缺失/为空 > 找不到测试入口 > 空跑（Ran 0 tests）>
+    复跑超时 > 退出码非 0 > 报告命中失败信号 > 通过。
+    """
+    evidence: dict = {"checked_at": datetime.now().isoformat(timespec="seconds")}
+
+    delivery, reason = _locate_delivery(sandbox_dir)
+    evidence["delivery_file"] = delivery
+    if delivery is None:
+        return False, reason, evidence
+    if (sandbox_dir / delivery).stat().st_size == 0:
+        return False, f"验收失败：交付脚本 {delivery} 为空文件。", evidence
+
+    test_entry = _locate_test_entry(sandbox_dir)
+    evidence["tests_file"] = test_entry
+    if test_entry is None:
+        return False, (
+            "验收失败：沙箱中未找到可独立运行的正式测试脚本"
+            "（新约定为 tests/test_main.py，历史结构为根目录 test_main.py），"
+            f"无法独立复跑验证交付脚本 {delivery}。"
+        ), evidence
+
+    try:
+        proc = execute_sandboxed(
+            sandbox_dir, sandbox_dir / test_entry, timeout=_VERIFY_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        evidence.update({"timed_out": True, "exit_code": None})
+        return False, (
+            f"验收失败：服务端独立复跑 {test_entry} 超过 {_VERIFY_TIMEOUT} 秒被强制终止。"
+            "正式测试必须是非交互、可独立快速跑完的脚本。"
+        ), evidence
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    combined = stdout + "\n" + stderr
+    evidence.update(
+        {
+            "timed_out": False,
+            "exit_code": proc.returncode,
+            "stdout_tail": stdout[-_VERIFY_TAIL:],
+            "stderr_tail": stderr[-_VERIFY_TAIL:],
+        }
+    )
+
+    if _RAN_ZERO_SIGNAL in combined:
+        return False, (
+            f"验收失败：服务端独立复跑 {test_entry} 时显示「Ran 0 tests」，"
+            "未真实执行任何用例，属无效证据（测试脚本需真正运行断言）。"
+        ), evidence
+
+    if proc.returncode != 0:
+        tail = (stderr or stdout).strip().splitlines()[-6:]
+        detail = " / ".join(line.strip() for line in tail) or "（无输出）"
+        return False, (
+            f"验收失败：服务端独立复跑 {test_entry} 退出码为 {proc.returncode}，"
+            f"测试未全部通过，交付脚本 {delivery} 未通过验收。输出摘要：{detail}"
+        ), evidence
+
+    report_name = tester_report_name(scope)
+    test_report = output_dir / report_name if report_name else None
+    if test_report is not None and test_report.is_file():
+        content = test_report.read_text(encoding="utf-8", errors="replace")
+        hit = next((sig for sig in _FAIL_SIGNALS if sig in content), None)
+        if hit:
+            return False, (
+                f"验收失败：测试报告中给出未通过结论（命中信号“{hit}”），"
+                f"与独立复跑结果不一致，请检查交付脚本 {delivery}。"
+            ), evidence
+
+    return True, (
+        f"验收通过：服务端独立复跑 {test_entry} 退出码 0，"
+        f"交付脚本 {delivery} 已落盘，测试报告未报告失败结论。"
+    ), evidence
 
 
 def _run_crew(
@@ -278,8 +578,9 @@ def _run_crew(
                 "sandbox_dir": str(sandbox_dir),
             }
         )
-        # 流程走完 ≠ 交付成功：必须通过客观验收（主脚本落盘 + 测试报告无失败结论）
-        accepted, reason = _evaluate_delivery(sandbox_dir, output_dir, scope)
+        # 流程走完 ≠ 交付成功：服务端独立复跑正式测试后给出结论，并持久化证据
+        accepted, reason, evidence = _run_verification(sandbox_dir, output_dir, scope)
+        _write_run_json(run_id, verification={"ok": accepted, "reason": reason, **evidence})
         with _jobs_lock:
             job["verdict_reason"] = reason
             if accepted:
@@ -347,11 +648,9 @@ def _scan_runs() -> list[dict]:
             base_run_id = job.get("base_run_id")
             scope_key = job.get("scope", DEFAULT_KEY)
         else:
-            # 服务重启后的历史任务：实时回放客观验收，失败任务保持红灯
+            # 服务重启后的历史任务：优先用持久化的复跑结论回放，绝不重跑
             scope_key = _load_run_meta(rid)["scope"]
-            accepted, _ = _evaluate_delivery(
-                SANDBOX_ROOT / rid, OUTPUTS_ROOT / rid, get_scope(scope_key)
-            )
+            accepted, _ = _verdict_for(rid)
             status = "archived" if accepted else "rejected"
             requirement = ""
             base_run_id = _load_lineage(rid).get("base_run_id")
@@ -370,11 +669,22 @@ def _scan_runs() -> list[dict]:
 
 
 def _list_py_files(sandbox_dir: Path) -> list[str]:
-    return sorted(
-        p.name
-        for p in sandbox_dir.iterdir()
-        if p.is_file() and is_safe_filename(p.name)
-    )
+    """列出沙箱内可供调试运行的脚本（相对 POSIX 路径），交付主脚本排最前。
+
+    只遍历沙箱根目录与 src/、tests/ 三个位置，不递归，因此不会带出
+    __pycache__ 等目录。**刻意排除 scratch/**：那里按约定只放探测/临时脚本，
+    列出来会把下拉框塞满（实测某迭代任务 37 项里有 33 项是探测脚本）。
+    """
+    files: list[str] = []
+    for subdir in ("src", "tests", ""):
+        for rel in _rel_py_files(sandbox_dir, subdir):
+            if is_safe_filename(rel) and rel not in files:
+                files.append(rel)
+    delivery, _ = _locate_delivery(sandbox_dir)
+    if delivery and delivery in files:
+        files.remove(delivery)
+        files.insert(0, delivery)
+    return files
 
 
 def _list_md_files(run_id: str) -> list[str]:
@@ -465,7 +775,11 @@ def create_job(body: RequirementBody):
         iteration_info = None
         if base_run_id is not None:
             assets = _prepare_iteration(base_run_id, sandbox_dir, scope)
-            if not assets["copied_py"] and not assets["copied_docs"]:
+            if (
+                not assets["copied_src"]
+                and not assets["copied_tests"]
+                and not assets["copied_docs"]
+            ):
                 # 基线目录存在但完全是空壳，拒绝并清理新建目录
                 shutil.rmtree(sandbox_dir, ignore_errors=True)
                 shutil.rmtree(output_dir, ignore_errors=True)
@@ -536,9 +850,7 @@ def get_job(run_id: str):
         # 可能是历史任务（服务重启后内存中无记录）：回放验收结论
         if (SANDBOX_ROOT / run_id).is_dir() or (OUTPUTS_ROOT / run_id).is_dir():
             scope_key = _scope_key_of(run_id)
-            accepted, reason = _evaluate_delivery(
-                SANDBOX_ROOT / run_id, OUTPUTS_ROOT / run_id, get_scope(scope_key)
-            )
+            accepted, reason = _verdict_for(run_id)
             lineage = _load_lineage(run_id)
             return {
                 "run_id": run_id,
@@ -558,12 +870,14 @@ def get_job(run_id: str):
 def list_files(run_id: str):
     _validate_run_id(run_id)
     scope = get_scope(_scope_key_of(run_id))
+    delivery, _ = _locate_delivery(SANDBOX_ROOT / run_id)
     return {
         "run_id": run_id,
         "scope": scope.key,
         "py_files": _list_py_files(SANDBOX_ROOT / run_id),
         "md_files": _list_md_files(run_id),
         "primary_doc": primary_doc_name(scope),
+        "primary_script": delivery,
     }
 
 
@@ -585,7 +899,7 @@ def read_file(run_id: str, kind: str, name: str):
     else:
         raise HTTPException(status_code=400, detail="kind 只能是 sandbox 或 outputs")
 
-    if not str(path).startswith(str(allowed_root)) or not path.is_file():
+    if not path.is_relative_to(allowed_root) or not path.is_file():
         raise HTTPException(status_code=404, detail="文件不存在或路径越界")
 
     return {"name": name, "kind": kind, "content": path.read_text(encoding="utf-8")}
@@ -595,11 +909,15 @@ def read_file(run_id: str, kind: str, name: str):
 def exec_file(run_id: str, body: ExecBody):
     """在安全沙箱中运行该任务目录下的指定脚本（与 Agent 使用同一套审计钩子）。"""
     sandbox_dir = _validate_run_id(run_id)
+    root = sandbox_dir.resolve()
     if not is_safe_filename(body.filename):
-        raise HTTPException(status_code=400, detail="非法文件名，仅允许 .py 且不含路径")
+        raise HTTPException(
+            status_code=400,
+            detail="非法文件名，仅允许 .py，最多一层子目录（如 src/main.py）",
+        )
 
     script_path = (sandbox_dir / body.filename).resolve()
-    if not str(script_path).startswith(str(sandbox_dir.resolve())) or not script_path.is_file():
+    if not script_path.is_relative_to(root) or not script_path.is_file():
         raise HTTPException(status_code=404, detail="脚本不存在或路径越界")
 
     # 纵深防御：运行前再做一次 AST 静态检查（文件由 Agent 生成，防外部篡改）

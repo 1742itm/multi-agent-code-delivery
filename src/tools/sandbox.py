@@ -133,7 +133,8 @@ _BLOCKED_ATTRS = frozenset(
     }
 )
 
-_FILENAME_RE = re.compile(r"^[A-Za-z0-9_\-.]+\.py$")
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_\-.]+$")
+_MAX_SUBDIR_DEPTH = 1
 _OUTPUT_LIMIT = 8000
 
 _DEFAULT_TASK_DIR = (
@@ -152,8 +153,9 @@ class SandboxExecInput(BaseModel):
     code: str = Field(..., description="要在沙箱中执行的完整 Python 3 源代码")
     filename: str = Field(
         default="solution.py",
-        description="代码保存的文件名（仅允许字母数字下划线中划线，.py 后缀，"
-        "保存在当前沙箱目录内，可用于多文件协作）",
+        description="代码保存的相对路径，仅允许字母数字下划线中划线，"
+        "最多一层子目录（如 main.py、src/main.py、tests/test_main.py），"
+        ".py 后缀，保存在当前沙箱目录内，可用于多文件协作",
     )
     timeout: int = Field(
         default=60, ge=1, le=60, description="执行超时秒数（1-60，默认 60）"
@@ -203,8 +205,22 @@ def static_check(code: str) -> list[str]:
 
 
 def is_safe_filename(filename: str) -> bool:
-    """文件名是否符合沙箱命名规则（禁止路径分隔符，必须 .py 结尾）。"""
-    return bool(_FILENAME_RE.match(filename))
+    """校验脚本的相对路径是否符合沙箱命名规则。
+
+    - 最多一层子目录（如 src/main.py、tests/test_main.py）
+    - 各段仅允许字母/数字/下划线/中划线，不以点开头（顺带挡掉 . / .. 与隐藏文件）
+    - 必须 .py 结尾；不接受绝对路径与反斜杠分隔
+    """
+    if not filename or "\\" in filename or filename.startswith("/"):
+        return False
+    parts = filename.split("/")
+    if len(parts) > _MAX_SUBDIR_DEPTH + 1:
+        return False
+    if not parts[-1].endswith(".py"):
+        return False
+    return all(
+        _SEGMENT_RE.match(part) and not part.startswith(".") for part in parts
+    )
 
 
 def build_clean_env() -> dict[str, str]:
@@ -248,7 +264,9 @@ class SafePythonExecTool(BaseTool):  # type: ignore[misc]
         "在安全沙箱中执行 Python 3 代码并返回 stdout/stderr 与退出码。"
         "允许正常网络访问（urllib/requests 等）与沙箱目录内文件读写；"
         "禁止进程创建、系统命令、动态库加载、注册表操作与沙箱目录外文件读写。"
-        "代码保存到沙箱目录中的 filename 文件后执行，可多次调用以实现多文件协作。"
+        "代码按 filename 保存到沙箱目录后执行，filename 最多可带一层子目录"
+        "（业务代码放 src/、正式测试放 tests/、临时脚本放 scratch/），"
+        "可多次调用以实现多文件协作。"
     )
     args_schema: type[BaseModel] = SandboxExecInput
 
@@ -257,7 +275,7 @@ class SafePythonExecTool(BaseTool):  # type: ignore[misc]
         if not is_safe_filename(filename):
             return (
                 f"[沙箱拒绝] 非法文件名 '{filename}'：仅允许字母/数字/下划线/中划线，"
-                "且必须以 .py 结尾"
+                "最多一层子目录（如 src/main.py），且必须以 .py 结尾"
             )
 
         # 2. AST 静态扫描
@@ -271,6 +289,8 @@ class SafePythonExecTool(BaseTool):  # type: ignore[misc]
         task_dir = Path(os.environ.get("SANDBOX_TASK_DIR", str(_DEFAULT_TASK_DIR)))
         task_dir.mkdir(parents=True, exist_ok=True)
         script_path = task_dir / filename
+        # 支持 src/、tests/ 这类一层子目录：落盘前先建父目录
+        script_path.parent.mkdir(parents=True, exist_ok=True)
         script_path.write_text(code, encoding="utf-8")
 
         # 4. 清洗环境变量后在隔离子进程中运行（强制 UTF-8，不携带任何密钥）
