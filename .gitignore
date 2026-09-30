@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # 任务产物（沙箱代码与产出文档）
 workspace/

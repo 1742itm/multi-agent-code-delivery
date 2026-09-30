@@ -8,7 +8,10 @@
 每个 Task 的产出同时写入 workspace/outputs/<run_id>/ 下的 Markdown 文件，
 文件名由 scope 的步骤顺序派生（见 pipelines.numbered_name）。
 
-full 的描述文案与改造前逐字一致（零回归锚点，改动前已取 sha256 基线）。
+full 四个任务的描述文案有 sha256 冻结快照（见 tests/test_prompts.py）。
+注意：迁到 src/ + tests/ 目录约定时，develop / test / document 三条描述已按计划改写，
+只有 _ANALYZE_BODY（01_requirements.md）与改造前逐字相同 —— 不要把快照误当成
+"改造前基线"；改提示词时需要同步更新该文件里的常量。
 """
 
 from __future__ import annotations

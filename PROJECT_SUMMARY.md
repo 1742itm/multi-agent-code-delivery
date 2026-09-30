@@ -113,6 +113,11 @@ agentdemo/
 ├── main.py                     # 命令行入口
 ├── web_server.py               # FastAPI 服务（提交/轮询/文件/运行/验收/迭代）
 ├── clean_history.py            # 历史任务清理脚本
+├── requirements.txt            # 运行期依赖
+├── requirements-dev.txt        # 测试依赖（pytest）
+├── pytest.ini                  # pytest 配置（限定 tests/，排除 workspace 被误收集）
+├── .github/workflows/ci.yml    # CI：push/PR 跑 pytest -m "not local"
+├── tests/                      # 回归测试（提示词冻结快照、验收判定、沙箱执行语义…）
 ├── static/index.html           # 单文件前端（原生 JS，无框架）
 ├── src/
 │   ├── agents.py               # 四个角色定义 + 沙箱纪律
@@ -165,6 +170,8 @@ agentdemo/
 | 沙箱目录约定 | 路径矩阵 + 真实落盘执行 | 单层子目录放行；`..`、两级子目录、反斜杠、非 .py 一律拒绝 |
 | 迭代 import 闭包桥接 | 对 3 个历史扁平基线实测 | 30 个 .py 的基线只带过来 `main.py`+`quotes_parser.py`+`test_main.py`，探测脚本零带入 |
 | 零回归校验 | 历史回放冻结 + 零写回 + 提示词逐行 diff | 8 个历史任务 `status`/`verdict_reason` 逐字不变；260 个 workspace 文件 sha256 零变化；提示词改动仅落在目录约定相关句子 |
+| 自动化回归套件 | `pytest` 137 项 + GitHub Actions | 本机 137 全绿（含 18 项依赖真实历史任务的 local 用例），CI 跑 119 项；提示词 sha256 冻结快照、验收 8 类判定、沙箱执行语义等全部固化 |
+| 测试有效性演练 | 故意改坏 8 处生产代码 | 删失败信号、删 `src/main.py` 分支、改编号格式、放开 base 文档、混入不存在的上游、写非法占位符、拆保险丝、关密钥隔离 —— 8 条全部被测试抓到并精确还原 |
 
 复杂流程四个任务的提示词锚点（sha256，改动后重取）：`01_requirements.md` `4507f10c…`（未变）、`02_implementation.md` `b6090cf7…`、`03_test_report.md` `d4b90c8f…`、`04_final_report.md` `7031dc0f…`。
 
