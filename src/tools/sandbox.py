@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from crewai.tools import BaseTool
@@ -136,6 +137,8 @@ _BLOCKED_ATTRS = frozenset(
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_\-.]+$")
 _MAX_SUBDIR_DEPTH = 1
 _OUTPUT_LIMIT = 8000
+# 子进程输出回传上限（展示上限只取 _OUTPUT_LIMIT，这里留足余量以免丢掉关键尾部信息）
+_CAPTURE_LIMIT = 64 * 1024
 
 _DEFAULT_TASK_DIR = (
     Path(__file__).resolve().parents[2] / "workspace" / "sandbox" / "default"
@@ -239,23 +242,48 @@ def execute_sandboxed(
     """在隔离子进程中执行沙箱目录内的脚本（审计钩子 + 清洗环境 + 超时）。
 
     供 Agent 工具与 Web 运行接口共用。超时抛出 subprocess.TimeoutExpired。
+
+    输出不经过管道回传，而是重定向到临时文件后**只读回尾部**：
+    管道 + capture_output 会把子进程的全部 stdout 缓存在父进程内存里，
+    一个疯狂打印的脚本足以把服务撑爆。只取尾部不影响任何判定——
+    验收依据是退出码，而 "Ran 0 tests" 也是 unittest 打在末尾的。
     """
-    return subprocess.run(
-        [
-            sys.executable,
-            str(_RUNNER_PATH),
-            str(task_dir),
-            str(script_path),
-        ],
-        cwd=str(task_dir),
-        env=build_clean_env(),
-        timeout=timeout,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        input=stdin or "",
-    )
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(_RUNNER_PATH),
+                str(task_dir),
+                str(script_path),
+            ],
+            cwd=str(task_dir),
+            env=build_clean_env(),
+            timeout=timeout,
+            stdout=out_file,
+            stderr=err_file,
+            # input 会自行建立 stdin 管道，不能再显式传 stdin=
+            input=(stdin or "").encode("utf-8"),
+        )
+        stdout = _read_tail(out_file)
+        stderr = _read_tail(err_file)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+
+def _read_tail(handle, limit: int = _CAPTURE_LIMIT) -> str:
+    """从临时文件尾部读取最多 limit 字节，避免全量读入内存。
+
+    换行按 text=True 时的旧语义归一（\r\n / \r → \n），
+    否则 Windows 子进程写文件会把行尾变成 CRLF，下游显示与断言都会跟着变。
+    """
+    handle.flush()
+    size = handle.seek(0, os.SEEK_END)
+    start = max(0, size - limit)
+    handle.seek(start)
+    text = handle.read().decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if start:
+        return f"...（已省略前 {start} 字节输出）\n{text}"
+    return text
 
 
 class SafePythonExecTool(BaseTool):  # type: ignore[misc]

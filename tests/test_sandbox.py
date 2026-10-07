@@ -193,6 +193,41 @@ class TestExecutionSemantics:
         assert not outside.exists()
 
 
+class TestBoundedOutput:
+    """子进程输出必须有上限：管道全量缓存会把服务 OOM 掉。"""
+
+    def test_huge_output_is_capped_and_tail_is_kept(self, tmp_path):
+        script = _write(tmp_path / "loud.py", (
+            "for i in range(200000):\n"
+            "    print('noise-%06d' % i)\n"
+            "print('TAIL-MARKER')\n"
+        ))
+        proc = _run(tmp_path, script)
+        assert proc.returncode == 0
+        assert len(proc.stdout) <= sb._CAPTURE_LIMIT + 200, len(proc.stdout)
+        # 尾部（判决依据所在处）必须保留
+        assert "TAIL-MARKER" in proc.stdout
+        assert "已省略前" in proc.stdout
+
+    def test_small_output_is_returned_verbatim(self, tmp_path):
+        script = _write(tmp_path / "quiet.py", "print('hello')\n")
+        assert _run(tmp_path, script).stdout == "hello\n"
+
+    def test_huge_output_does_not_break_exit_code(self, tmp_path):
+        script = _write(tmp_path / "loud_fail.py", (
+            "for i in range(100000):\n"
+            "    print('noise')\n"
+            "raise SystemExit(2)\n"
+        ))
+        assert _run(tmp_path, script).returncode == 2
+
+    def test_stdin_still_passes_through(self, tmp_path):
+        script = _write(tmp_path / "echo.py", "print(input().upper())\n")
+        proc = _run(tmp_path, script, stdin="abc\n")
+        assert proc.returncode == 0
+        assert proc.stdout.strip() == "ABC"
+
+
 class TestNoRepoLeak:
     def test_default_sandbox_dir_was_not_created(self):
         """护栏：_DEFAULT_TASK_DIR 指向真实仓库，测试绝不能把它写出来。"""

@@ -167,6 +167,18 @@ class TestRunVerificationBranches:
         assert ev["timed_out"] is False
         assert "checked_at" in ev
 
+    def test_pass_survives_huge_stdout(self, tmp_path):
+        # 判据是退出码，不是输出内容：脚本狂打印也不能影响验收结论
+        noisy = TEST_OK.replace(
+            "class T(unittest.TestCase):",
+            "for i in range(50000):\n    print('noise')\n\n\nclass T(unittest.TestCase):",
+        )
+        sandbox, outputs = _build(tmp_path, test_code=noisy)
+        ok, reason, ev = ws._run_verification(sandbox, outputs, pl.FULL)
+        assert ok is True, reason
+        assert ev["exit_code"] == 0
+        assert len(ev["stdout_tail"]) <= 2000
+
     def test_legacy_layout_still_verifiable(self, tmp_path):
         sandbox, outputs = _build(tmp_path, layout="legacy")
         ok, reason, ev = ws._run_verification(sandbox, outputs, pl.FULL)
